@@ -29,6 +29,7 @@
  *          UI→Motor interface at the cost of a 100 ms polling latency.
  */
 
+#include "printf.h"
 #include "rtos_menu.h"
 #include "main.h"
 #include "liquidcrystal_i2c.h"
@@ -664,8 +665,8 @@ void RtosMenu_TaskUI(void *argument) {
         TickType_t waitTime = portMAX_DELAY;
         TickType_t now = xTaskGetTickCount();
         if (gMenuState == MENU_PUMPING_VIEW) {
-            if ((now - lastDrawTick) >= pdMS_TO_TICKS(500)) waitTime = 0;
-            else waitTime = pdMS_TO_TICKS(500) - (now - lastDrawTick);
+            if ((now - lastDrawTick) >= pdMS_TO_TICKS(SCREEN_REMAINING_VOL_UPDATE)) waitTime = 0;
+            else waitTime = pdMS_TO_TICKS(SCREEN_REMAINING_VOL_UPDATE) - (now - lastDrawTick);
         }
         
         if (xQueueReceive(InputQueue, &msg, waitTime) == pdTRUE) {
