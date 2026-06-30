@@ -111,7 +111,7 @@
 /** @} */
 
 /** @brief PCF8574 I2C slave address (7-bit = 0x3F, left-shifted for HAL) */
-#define DEVICE_ADDR     (0x3F << 1)
+#define DEVICE_ADDR     (0x27 << 1)
 
 /* -------------------------------------------------------------------------- */
 /*                          Public API Functions                              */
