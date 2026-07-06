@@ -100,26 +100,24 @@ int main(void)
   MX_TIM1_Init();
   MX_TIM2_Init();
   MX_USART2_UART_Init();
+  MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
     HAL_TIM_Encoder_Start(&htim1, TIM_CHANNEL_ALL);
-
     stepper_init((StepperControl_t*) &gStepperControl);
-
     HD44780_Init(2);
-
     RtosMenu_Init();
 
-    /*
-     * Create the three FreeRTOS tasks:
-     *   InputTask (prio 3): 50 Hz GPIO/encoder polling → produces input events
-     *   UITask    (prio 2): Event-driven LCD menu state machine
-     *   MotorTask (prio 4): Kinematics computation and pump monitoring
-     */
-    xTaskCreate(RtosMenu_TaskInput, "InputTask", 128, NULL, 3, NULL);
-    xTaskCreate(RtosMenu_TaskUI, "UITask", 512, NULL, 2, NULL);
-    xTaskCreate(RtosMenu_TaskMotor, "MotorTask", 512, NULL, 4, NULL);
+	/*
+	 * Create the three FreeRTOS tasks:
+	 *   InputTask (prio 3): 50 Hz GPIO/encoder polling → produces input events
+	 *   UITask    (prio 2): Event-driven LCD menu state machine
+	 *   MotorTask (prio 4): Kinematics computation and pump monitoring
+	 */
+	xTaskCreate(RtosMenu_TaskInput, "InputTask", 128, NULL, 3, NULL);
+	xTaskCreate(RtosMenu_TaskUI, "UITask", 512, NULL, 2, NULL);
+	xTaskCreate(RtosMenu_TaskMotor, "MotorTask", 512, NULL, 4, NULL);
 
-    vTaskStartScheduler();
+	vTaskStartScheduler();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -170,8 +168,10 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
-  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_USART2|RCC_PERIPHCLK_I2C1
-                              |RCC_PERIPHCLK_TIM1|RCC_PERIPHCLK_TIM2;
+  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_USART1|RCC_PERIPHCLK_USART2
+                              |RCC_PERIPHCLK_I2C1|RCC_PERIPHCLK_TIM1
+                              |RCC_PERIPHCLK_TIM2;
+  PeriphClkInit.Usart1ClockSelection = RCC_USART1CLKSOURCE_PCLK2;
   PeriphClkInit.Usart2ClockSelection = RCC_USART2CLKSOURCE_PCLK1;
   PeriphClkInit.I2c1ClockSelection = RCC_I2C1CLKSOURCE_HSI;
   PeriphClkInit.Tim1ClockSelection = RCC_TIM1CLK_HCLK;

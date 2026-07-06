@@ -33,14 +33,14 @@
 #define TIMER_CLOCK 72000000       ///< Timer input clock frequency in Hz (APB1 = 72 MHz for STM32F303RE)
 #define PRESCALER 71               ///< TIM2 prescaler value; effective tick = TIMER_CLOCK/(PRESCALER+1) = 1 MHz
 #define START_ARR ((TIMER_CLOCK / ((PRESCALER + 1) * START_FREQ_HZ)) - 1) ///< ARR value corresponding to START_FREQ_HZ
-#define START_FREQ_HZ 500          ///< Initial step frequency (Hz) at the start of acceleration ramp
-#define MAX_ACCEL_STEPS 1500       ///< Maximum number of steps in the acceleration/deceleration ramp
+#define START_FREQ_HZ 3000          ///< Initial step frequency (Hz) at the start of acceleration ramp
+#define MAX_ACCEL_STEPS 15000       ///< Maximum number of steps in the acceleration/deceleration ramp
 #define MIN_ACCEL_STEPS 100        ///< Minimum number of acceleration steps for low speeds
-#define TARGET_ACCEL_RATE 2000.0f ///< Target constant acceleration rate in steps/sec^2
+#define TARGET_ACCEL_RATE 1000.0f ///< Target constant acceleration rate in steps/sec^2
 #define CALIBRATION_PUMP_DISTANCE_MM  10.0f   ///< Distance to pump for auto diameter calibration
-#define MANUAL_CRUISE_FREQ 5000    ///< Stepper manual control constant speed, in Hz
-#define MANUAL_TOTAL_STEPS 100000  ///< Dummy total steps, manual drive controlled via buttons
-#define MANUAL_ACCEL_STEPS 300     ///< Constant acceleration steps for manual drive
+#define MANUAL_CRUISE_FREQ 50000    ///< Stepper manual control constant speed, in Hz
+#define MANUAL_TOTAL_STEPS 4000000  ///< Dummy total steps, manual drive controlled via buttons
+#define MANUAL_ACCEL_STEPS 3000     ///< Constant acceleration steps for manual drive
 #define STEPPER_DIR_FORWARD 1      ///< Used in HAL_GPIO_WritePin(), modify according to stepper driver direction pin
 #define STEPPER_DIR_BACKWARD 0     ///< Used in HAL_GPIO_WritePin(), modify according to stepper driver direction pin
 /** @} */
@@ -88,11 +88,12 @@ typedef struct{
 	uint16_t accelLookupTable[MAX_ACCEL_STEPS]; ///< Pre-computed ARR values for the S-curve ramp profile
 
 	MotorState_e MotorState;          ///< Current state of the motor state machine
-	MotorMode_e MotorMode;            ///< Current mode of the motor state machine, programmed or manual action
+	MotorMode_e  MotorMode;           ///< Current mode of the motor state machine, programmed or manual action
 }StepperControl_t;
 
 /**
- * @brief  Initialize all stepper control fields to safe defaults.
+ * @brief  Initialize all stepper control fields to safe defaults and configure
+ *         the TMC2208 driver over UART.
  * @param  stepper Pointer to the StepperControl_t instance to initialize.
  * @note   Must be called before any other stepper function, and before the
  *         FreeRTOS scheduler starts.
@@ -138,6 +139,12 @@ void stepper_generate_accel_curve(StepperControl_t* stepper, float startFreqHz, 
  */
 void stepper_start(StepperControl_t* stepper, float cruiseFreqHz, uint32_t totalSteps, uint32_t accelSteps);
 
+/**
+ * @brief  Switch the TMC2208 between SpreadCycle and StealthChop at runtime.
+ * @param  enable  true  → SpreadCycle (active pumping / manual drive)
+ *                 false → StealthChop (idle — silent and cooler)
+ */
+void stepper_set_spreadcycle(uint8_t enable);
 
 
 #endif // LIBS_INC_STEPPER_H_

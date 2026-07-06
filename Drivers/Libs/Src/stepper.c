@@ -24,13 +24,33 @@
  */
 
 #include "stepper.h"
+#include "usart.h"
+
+/*
+ * Expand the IC cache to support all 4 possible UART addresses (0-3).
+ * The TMC2208 UART address is set by the MS1/MS2 pins: if they are not
+ * explicitly tied to GND the address may not be 0.  With IC_CACHE_COUNT=4
+ * shadow registers work correctly regardless of which address is used.
+ * Must be defined BEFORE including TMC2208.h because of the #ifndef guard.
+ */
+#ifndef TMC2208_IC_CACHE_COUNT
+#define TMC2208_IC_CACHE_COUNT 4
+#endif
+
+#include "TMC2208.h"
 
 /** @brief TIM2 handle (defined in tim.c by CubeMX). Used for stepper PWM output. */
 extern TIM_HandleTypeDef htim2;
+uint16_t node_id = 0xFFFF;
+
 
 /**
- * @brief  Initialize all stepper control fields to safe defaults.
+ * @brief  Initialize all stepper control fields to safe defaults and configure
+ *         the TMC2208 over UART.
  * @param  stepper Pointer to the StepperControl_t instance to initialize.
+ * @retval true  TMC2208 found and configured over UART.
+ * @retval false TMC2208 did not respond within 2 s; motor state is IDLE,
+ *               chip is running with standalone hardware defaults.
  */
 void stepper_init(StepperControl_t *stepper)
 {
@@ -41,8 +61,99 @@ void stepper_init(StepperControl_t *stepper)
     stepper->decelStartStep = 0;
     stepper->rampStepCounter = 0;
 
-    stepper->MotorState = MOTOR_STATE_IDLE;
-    stepper->MotorMode = MOTOR_MODE_NONE;
+    stepper->MotorState    = MOTOR_STATE_IDLE;
+    stepper->MotorMode     = MOTOR_MODE_NONE;
+    
+
+    uint32_t ioin = 0;
+
+    while (node_id == 0xFFFF) {
+        /* Scan all 4 possible UART addresses */
+        for (uint16_t addr = 0; addr < 4; addr++) {
+            ioin = (uint32_t)tmc2208_readRegister(addr, TMC2208_IOIN);
+            if (((ioin >> 24) & 0xFF) == 0x20) {
+                node_id = addr;
+                break;
+            }
+        }
+    }
+
+    // Pre-seed shadow cache with hardware reset defaults
+    uint32_t chopconf_default = 0x10000053U;
+    uint32_t pwmconf_default  = 0xC10D0024U;
+    tmc2208_cache(node_id, TMC2208_CACHE_FILL_DEFAULT, TMC2208_CHOPCONF, &chopconf_default);
+    tmc2208_cache(node_id, TMC2208_CACHE_FILL_DEFAULT, TMC2208_PWMCONF,  &pwmconf_default);
+
+    uint32_t gconf = (uint32_t)tmc2208_readRegister(node_id, TMC2208_GCONF);
+    gconf = tmc2208_fieldUpdate(gconf, TMC2208_PDN_DISABLE_FIELD,      1); // Enable UART control
+    gconf = tmc2208_fieldUpdate(gconf, TMC2208_MSTEP_REG_SELECT_FIELD, 1); // MRES from register
+    gconf = tmc2208_fieldUpdate(gconf, TMC2208_EN_SPREADCYCLE_FIELD,   0); // StealthChop at idle
+    gconf = tmc2208_fieldUpdate(gconf, TMC2208_MULTISTEP_FILT_FIELD,   0); // No step filter
+    tmc2208_writeRegister(node_id, TMC2208_GCONF, (int32_t)gconf);
+
+    uint32_t chopconf = (uint32_t)tmc2208_readRegister(node_id, TMC2208_CHOPCONF);
+    chopconf = tmc2208_fieldUpdate(chopconf, TMC2208_MRES_FIELD,   1); // 128 microsteps
+    chopconf = tmc2208_fieldUpdate(chopconf, TMC2208_INTPOL_FIELD, 0); // No interpolation
+    tmc2208_writeRegister(node_id, TMC2208_CHOPCONF, (int32_t)chopconf);
+
+    tmc2208_writeRegister(node_id, TMC2208_TPWMTHRS, 0);
+
+}
+
+/**
+ * @brief  Switch the TMC2208 chopper mode at runtime.
+ *
+ * @param  enable  true  → SpreadCycle (use when motor is actively driving load)
+ *                 false → StealthChop (use at idle — silent, lower temperature)
+ *
+ * @details Does a live GCONF read-modify-write over UART.  Safe to call from
+ *          any thread context as long as UART is not simultaneously used by
+ *          another task.  Has no effect if stepper_init() did not succeed
+ */
+void stepper_set_spreadcycle(uint8_t enable)
+{
+    uint32_t gconf = (uint32_t)tmc2208_readRegister(node_id, TMC2208_GCONF);
+    gconf = tmc2208_fieldUpdate(gconf, TMC2208_EN_SPREADCYCLE_FIELD, enable ? 1U : 0U);
+    tmc2208_writeRegister(node_id, TMC2208_GCONF, (int32_t)gconf);
+}
+
+uint8_t tmc2208_getNodeAddress(uint16_t icID)
+{
+    // icID directly encodes the UART node address (0–3), set by MS1/MS2 pins.
+    return (uint8_t)icID;
+}
+
+bool tmc2208_readWriteUART(uint16_t icID, uint8_t *data, size_t writeLength, size_t readLength)
+{
+
+     // USART1 is configured in HAL half-duplex mode
+
+    HAL_HalfDuplex_EnableTransmitter(&huart1);
+
+    if (HAL_UART_Transmit(&huart1, data, (uint16_t)writeLength, 100) != HAL_OK) {
+        return false;
+    }
+
+    if (readLength > 0) {
+        uint32_t tickstart = HAL_GetTick();
+        while (__HAL_UART_GET_FLAG(&huart1, UART_FLAG_TC) == RESET) {
+            if ((HAL_GetTick() - tickstart) > 50U) {
+                return false;
+            }
+        }
+
+        __HAL_UART_SEND_REQ(&huart1, UART_RXDATA_FLUSH_REQUEST);
+        __HAL_UART_CLEAR_FLAG(&huart1, UART_CLEAR_OREF | UART_CLEAR_NEF |
+                                        UART_CLEAR_PEF | UART_CLEAR_FEF);
+
+        HAL_HalfDuplex_EnableReceiver(&huart1);
+
+        if (HAL_UART_Receive(&huart1, data, (uint16_t)readLength, 100) != HAL_OK) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 /**

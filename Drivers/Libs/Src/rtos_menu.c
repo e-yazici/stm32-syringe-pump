@@ -59,7 +59,7 @@ extern TIM_HandleTypeDef htim2;
 #define MATH_PI                         3.14159265f  ///< Pi constant for syringe area calculation
 #define VOL_ML_TO_MM3                   1000.0f ///< Conversion factor: 1 mL = 1000 mm³
 #define TIME_MIN_TO_SEC                 60.0f   ///< Conversion factor: 1 min = 60 sec
-#define DEFAULT_MICROSTEPPING           16      ///< Default driver microstepping divisor
+#define DEFAULT_MICROSTEPPING           128      ///< Default driver microstepping divisor
 #define ENCODER_BIT_SHIFT				2       ///< Right-shift for TIM1 CNT to get detent-aligned encoder ticks
 #define MANUAL_MODE_UPDATE_DELAY		50      ///< Input polling period is ms while manual motor drive
 /** @} */
@@ -115,7 +115,7 @@ MenuState_e gMenuState = MENU_OVERVIEW;
 PumpHardwareSpecs_t gPumpHw = {
     .screwLead_mm_per_rev = 2.0f,       ///< Lead screw travel per revolution (2mm for T8 lead screw)
     .motorStepsPerRev = 200,             ///< 1.8° stepper = 200 full steps/rev
-    .microstepping = 16,                 ///< Driver microstepping divisor
+    .microstepping = DEFAULT_MICROSTEPPING, ///< Must match CHOPCONF MRES set by stepper_init() over UART
     .maxFlowRate_ul_min = 100000.0f,     ///< Theoretical max flow in µL/min
     .maxFlowRate_ml_min = 100.0f         ///< Theoretical max flow in mL/min
 };
@@ -413,8 +413,8 @@ static float ClampFlowRate(float val, FlowUnit_e unit) {
     if (val < 0.0f) val = 0.0f;
     float max_val = 1000.0f;
     switch(unit) {
-        case FLOW_UNIT_ML_MIN: max_val = 60.0f; break;
-        case FLOW_UNIT_UL_MIN: max_val = 1000.0f; break;
+        case FLOW_UNIT_ML_MIN: max_val = gPumpHw.maxFlowRate_ml_min; break;
+        case FLOW_UNIT_UL_MIN: max_val = gPumpHw.maxFlowRate_ul_min; break;
         case FLOW_UNIT_ML_HR: max_val = 999.99f; break;
         case FLOW_UNIT_UL_HR: max_val = 9999.99f; break;
     }
@@ -1423,6 +1423,7 @@ void RtosMenu_TaskUI(void *argument) {
                             
                             gSysState = SYS_IDLE;
                             gMenuState = MENU_PUMP_CANCELLED;
+                            stepper_set_spreadcycle(false);
                             HD44780_Clear();
                             HD44780_SetCursor(0, 0);
                             HD44780_PrintStr("Pump Cancelled!");
@@ -1650,7 +1651,7 @@ void RtosMenu_TaskMotor(void *argument) {
                 /* ---- Calibration Pumping: Fixed distance ---- */
                 float stepsPerMm = ((float)gPumpHw.motorStepsPerRev / gPumpHw.screwLead_mm_per_rev) * (float)DEFAULT_MICROSTEPPING;
                 uint32_t totalSteps = (uint32_t)(CALIBRATION_PUMP_DISTANCE_MM * stepsPerMm);
-                float cruiseHz = 2.0f * stepsPerMm; /* 2 mm/sec fixed speed */
+                float cruiseHz = 2.0f * stepsPerMm;
                 
                 /* Kinematic acceleration step calculation: S = V^2 / 2A */
                 uint32_t accel = (uint32_t)((cruiseHz * cruiseHz) / (2.0f * TARGET_ACCEL_RATE));
@@ -1658,10 +1659,12 @@ void RtosMenu_TaskMotor(void *argument) {
                 if (accel < MIN_ACCEL_STEPS) accel = MIN_ACCEL_STEPS;
                 if (totalSteps < 2 * accel) accel = totalSteps / 2;
                 
+                stepper_set_spreadcycle(true);
                 stepper_start((StepperControl_t*)&gStepperControl, cruiseHz, totalSteps, accel);
                 
                 while (gSysState == SYS_PUMPING_CALIBRATION) {
                     if (gStepperControl.MotorState == MOTOR_STATE_IDLE) {
+                        stepper_set_spreadcycle(false);
                         InputMessage_t msg = { .event = EVENT_MOTOR_COMPLETE };
                         xQueueSend(InputQueue, &msg, 0);
                         break;
@@ -1713,19 +1716,13 @@ void RtosMenu_TaskMotor(void *argument) {
 
             /* Reset live progress tracker and launch the stepper */
             gLivePumpedVolume_ml = 0.0f;
+            stepper_set_spreadcycle(true);
             stepper_start((StepperControl_t*)&gStepperControl, cruiseHz, totalSteps, accel);
             
-            /*
-             * ---- Live progress monitoring loop ----
-             *
-             * Continuously converts the stepper's remaining step count back
-             * into a volume (mL) for the UI's real-time display. Runs until
-             * the motor completes or the system state changes.
-             */
             while (gSysState == SYS_PUMPING || gSysState == SYS_PAUSED) {
                 if (gStepperControl.MotorState == MOTOR_STATE_IDLE && gSysState != SYS_PAUSED) {
-                    mainMenuCursor = 0; // Set cursor to first element after pump completion.
-                    /* Signal the UI task that pumping is complete */
+                    stepper_set_spreadcycle(false);
+                    mainMenuCursor = 0;
                     InputMessage_t msg = { .event = EVENT_MOTOR_COMPLETE };
                     xQueueSend(InputQueue, &msg, 0);
                     break;
