@@ -27,6 +27,7 @@
 /* USER CODE BEGIN Includes */
 #include "FreeRTOS.h"
 #include "task.h"
+#include "queue.h"
 #include "rtos_menu.h"
 #include "stepper.h"
 #include "liquidcrystal_i2c.h"
@@ -53,7 +54,9 @@
 // Global stepper motor control structure.
 volatile StepperControl_t gStepperControl = {.MotorMode = MOTOR_MODE_NONE,
         .MotorState = MOTOR_STATE_IDLE, };
-
+TaskHandle_t TaskInputHandle = NULL;
+extern SystemState_e gSysState;
+extern QueueHandle_t InputQueue;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -113,7 +116,7 @@ int main(void)
 	 *   UITask    (prio 2): Event-driven LCD menu state machine
 	 *   MotorTask (prio 4): Kinematics computation and pump monitoring
 	 */
-	xTaskCreate(RtosMenu_TaskInput, "InputTask", 128, NULL, 3, NULL);
+	xTaskCreate(RtosMenu_TaskInput, "InputTask", 128, NULL, 3, &TaskInputHandle);
 	xTaskCreate(RtosMenu_TaskUI, "UITask", 512, NULL, 2, NULL);
 	xTaskCreate(RtosMenu_TaskMotor, "MotorTask", 512, NULL, 4, NULL);
 
@@ -183,7 +186,28 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+  if (GPIO_Pin == buttonSelect_Pin)
+  {
+    if (HAL_GPIO_ReadPin(buttonSelect_GPIO_Port, buttonSelect_Pin) == GPIO_PIN_RESET)
+    {
+      if (gSysState == SYS_PUMPING || gSysState == SYS_PUMPING_CALIBRATION)
+      {
+        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
 
+        if (InputQueue != NULL) {
+          InputMessage_t msg;
+          msg.event = EVENT_BTN_SELECT_PRESS;
+          msg.timestamp = xTaskGetTickCountFromISR();
+          xQueueSendFromISR(InputQueue, &msg, &xHigherPriorityTaskWoken);
+        }
+
+        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+      }
+    }
+  }
+}
 /* USER CODE END 4 */
 
 /**

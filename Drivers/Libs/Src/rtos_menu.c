@@ -73,7 +73,7 @@ QueueHandle_t InputQueue = NULL;
 
 /** @brief Global stepper control struct (shared between tasks and TIM2 ISR) */
 extern volatile StepperControl_t gStepperControl;
-
+extern TaskHandle_t TaskInputHandle;
 /* ========================================================================== */
 /*                          Hardware Abstraction                              */
 /* ========================================================================== */
@@ -253,17 +253,22 @@ void RtosMenu_TaskInput(void *argument) {
     bool buttonSelect_long_fired = false;    ///< True if long-press event already fired for this press
 
     for (;;) {
+        if (gSysState == SYS_PUMPING || gSysState == SYS_PUMPING_CALIBRATION) {
+            vTaskSuspend(NULL); // Suspend myself
+            
+            /* Re-seed the edge detection state to prevent false clicks upon resuming */
+            lastButtonCursorLeft = (HAL_GPIO_ReadPin(buttonCursorLeft_GPIO_Port, buttonCursorLeft_Pin) == GPIO_PIN_SET);
+            lastButtonSelect = (HAL_GPIO_ReadPin(buttonSelect_GPIO_Port, buttonSelect_Pin) == GPIO_PIN_SET);
+            lastButtonCursorRight = (HAL_GPIO_ReadPin(buttonCursorRight_GPIO_Port, buttonCursorRight_Pin) == GPIO_PIN_SET);
+            lastEncCount = TIM1->CNT >> ENCODER_BIT_SHIFT;
+            buttonSelect_long_fired = false;
+            continue;
+        }
+
         /* --- Sample all GPIO inputs --- */
         bool buttonCursorLeft = (HAL_GPIO_ReadPin(buttonCursorLeft_GPIO_Port, buttonCursorLeft_Pin) == GPIO_PIN_SET);
         bool buttonSelect = (HAL_GPIO_ReadPin(buttonSelect_GPIO_Port, buttonSelect_Pin) == GPIO_PIN_SET);
         bool buttonCursorRight = (HAL_GPIO_ReadPin(buttonCursorRight_GPIO_Port, buttonCursorRight_Pin) == GPIO_PIN_SET);
-
-        /* --- Cursor Left button: rising-edge detection --- */
-//        if (buttonCursorLeft && !lastButtonCursorLeft) {
-//            msg.event = EVENT_BTN_CURSOR_LEFT_PRESS;
-//            msg.timestamp = xTaskGetTickCount();
-//            xQueueSend(InputQueue, &msg, 0);
-//        }
 
         /*
          * --- Left and Right buttons action detection ---
@@ -284,13 +289,6 @@ void RtosMenu_TaskInput(void *argument) {
         	xQueueSend(InputQueue, &msg, 0);
         	}
         }
-
-        /* --- Cursor Right button: rising-edge detection --- */
-//        if (buttonCursorRight && !lastButtonCursorRight) {
-//            msg.event = EVENT_BTN_CURSOR_RIGHT_PRESS;
-//            msg.timestamp = xTaskGetTickCount();
-//            xQueueSend(InputQueue, &msg, 0);
-//        }
 
         if(!buttonCursorRight){
         	if(lastButtonCursorRight){
@@ -689,8 +687,9 @@ void RtosMenu_TaskUI(void *argument) {
                     HD44780_PrintStr("Press any button");
                     
                     gStepperControl.totalStepsRemaining = 0;
+                    if (TaskInputHandle != NULL) vTaskResume(TaskInputHandle);
                 }
-                else if (msg.event == EVENT_BTN_SELECT_LONG_PRESS) {
+                else if (msg.event == EVENT_BTN_SELECT_PRESS) {
                     /* --- User requested pause --- */
                     gSysState = SYS_PAUSED; 
                     /* Start decelerating the stepper motor */
@@ -704,6 +703,7 @@ void RtosMenu_TaskUI(void *argument) {
                     HD44780_PrintStr("Cancel Pump?");
                     HD44780_SetCursor(0, 1);
                     HD44780_PrintStr("  YES    > NO");
+                    if (TaskInputHandle != NULL) vTaskResume(TaskInputHandle);
                 }
                 continue; /* Discard all other events while pumping */
             }
@@ -1028,6 +1028,7 @@ void RtosMenu_TaskUI(void *argument) {
                         HD44780_SetCursor(0, 0);
                         HD44780_PrintStr("Weight (g):");
                         PrintNumberWithCursor(tempWeight_g, "", "g", 5);
+                        if (TaskInputHandle != NULL) vTaskResume(TaskInputHandle);
                     }
                     break;
 
@@ -1429,6 +1430,7 @@ void RtosMenu_TaskUI(void *argument) {
                             HD44780_PrintStr("Pump Cancelled!");
                             HD44780_SetCursor(0, 1);
                             HD44780_PrintStr("Press any button");
+                            if (TaskInputHandle != NULL) vTaskResume(TaskInputHandle);
                         }
                         else {
                             /* --- User selected NO: RESUME the pump --- */

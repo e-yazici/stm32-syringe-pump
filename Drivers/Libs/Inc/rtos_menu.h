@@ -22,6 +22,7 @@
 #include <stdbool.h>
 #include "flash_storage.h"
 
+
 /**
  * @brief Physical capabilities of the syringe pump hardware
  *        These values are largely set once and used mathematically.
@@ -148,7 +149,6 @@ typedef struct {
     uint32_t timestamp;           ///< FreeRTOS tick count for  debounce filtering
 } InputMessage_t;
 
-/* --- Task Public Declarations --- */
 
 /**
  * @brief Initialize local parameters (Must be called before OS starts)
