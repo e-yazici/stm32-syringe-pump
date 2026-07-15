@@ -161,6 +161,18 @@ static uint8_t digit_cursor = 2;
 /*                           Initialization                                  */
 /* ========================================================================== */
 
+/* ========================================================================== */
+/*                     Hardware Interrupt Management                          */
+/* ========================================================================== */
+
+static inline void EnableSelectButtonISR(void) {
+    __HAL_GPIO_EXTI_CLEAR_IT(buttonSelect_Pin);
+    EXTI->IMR |= buttonSelect_Pin;
+}
+
+static inline void DisableSelectButtonISR(void) {
+    EXTI->IMR &= ~buttonSelect_Pin;
+}
 /**
  * @brief  Initialize the RTOS menu system and load saved syringe data.
  *
@@ -173,6 +185,7 @@ static uint8_t digit_cursor = 2;
  * @note   Must be called after peripheral init and before vTaskStartScheduler().
  */
 void RtosMenu_Init(void) {
+	DisableSelectButtonISR();
     /* Create the inter-task message queue (InputTask → UITask) */
     InputQueue = xQueueCreate(10, sizeof(InputMessage_t));
 
@@ -679,6 +692,7 @@ void RtosMenu_TaskUI(void *argument) {
                 if (msg.event == EVENT_MOTOR_COMPLETE) {
                     /* --- Natural pump completion --- */
                     gSysState = SYS_IDLE;
+                    DisableSelectButtonISR();
                     gMenuState = MENU_PUMP_COMPLETED;
                     HD44780_Clear();
                     HD44780_SetCursor(0, 0);
@@ -691,7 +705,8 @@ void RtosMenu_TaskUI(void *argument) {
                 }
                 else if (msg.event == EVENT_BTN_SELECT_PRESS) {
                     /* --- User requested pause --- */
-                    gSysState = SYS_PAUSED; 
+                    gSysState = SYS_PAUSED;
+                    DisableSelectButtonISR();
                     /* Start decelerating the stepper motor */
                     gStepperControl.MotorState = MOTOR_STATE_DECEL;
                     
@@ -827,6 +842,7 @@ void RtosMenu_TaskUI(void *argument) {
                                     HAL_GPIO_WritePin(stepperDir_GPIO_Port, stepperDir_Pin, STEPPER_DIR_BACKWARD);
                                 }
                                 gSysState = SYS_PUMPING;
+                                EnableSelectButtonISR();
                                 gMenuState = MENU_PUMPING_VIEW;
                                 HD44780_Clear();
                                 HD44780_SetCursor(0, 0);
@@ -1005,6 +1021,7 @@ void RtosMenu_TaskUI(void *argument) {
                 case MENU_ADD_SYRINGE_AUTO_PROMPT:
                     if (msg.event == EVENT_BTN_SELECT_PRESS) {
                         gSysState = SYS_PUMPING_CALIBRATION;
+                        EnableSelectButtonISR();
                         gMenuState = MENU_ADD_SYRINGE_AUTO_PUMPING;
                         HD44780_Clear();
                         HD44780_SetCursor(0, 0);
@@ -1021,6 +1038,7 @@ void RtosMenu_TaskUI(void *argument) {
                     /* Wait for EVENT_MOTOR_COMPLETE */
                     if (msg.event == EVENT_MOTOR_COMPLETE) {
                         gSysState = SYS_IDLE;
+                        DisableSelectButtonISR();
                         gMenuState = MENU_ADD_SYRINGE_AUTO_WEIGHT;
                         tempWeight_g = 1.0f;
                         digit_cursor = 5; /* Ones digit of fraction*/
@@ -1423,6 +1441,7 @@ void RtosMenu_TaskUI(void *argument) {
                             gStepperControl.MotorState = MOTOR_STATE_IDLE;
                             
                             gSysState = SYS_IDLE;
+                            DisableSelectButtonISR();
                             gMenuState = MENU_PUMP_CANCELLED;
                             stepper_set_spreadcycle(false);
                             HD44780_Clear();
@@ -1435,6 +1454,7 @@ void RtosMenu_TaskUI(void *argument) {
                         else {
                             /* --- User selected NO: RESUME the pump --- */
                             gSysState = SYS_PUMPING;
+                            EnableSelectButtonISR();
                             gMenuState = MENU_PUMPING_VIEW;
                             HD44780_Clear();
                             /* Restart the timer with acceleration from current state */
