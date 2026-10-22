@@ -38,6 +38,8 @@
 #include "FreeRTOS.h"
 #include "task.h"
 #include "queue.h"
+#include "semphr.h"
+#include "as5600.h"
 #include <limits.h>
 #include <stdio.h>
 #include <string.h>
@@ -70,6 +72,10 @@ extern TIM_HandleTypeDef htim2;
 
 /** @brief FreeRTOS queue for passing input events from TaskInput to TaskUI */
 QueueHandle_t InputQueue = NULL;
+/** @brief FreeRTOS mutex to protect I2C2 bus between LCD and AS5600 */
+SemaphoreHandle_t I2C2_Mutex = NULL;
+
+extern AS5600_Params_t gEncoderParams;
 
 /** @brief Global stepper control struct (shared between tasks and TIM2 ISR) */
 extern volatile StepperControl_t gStepperControl;
@@ -129,7 +135,7 @@ PumpHardwareSpecs_t gPumpHw = {
 PumpJobParams_t gPumpJob = {
     .targetVolume = 1.0f,
     .volumeUnit = VOL_UNIT_ML,
-    .targetFlowRate = 2.0f,
+    .targetFlowRate = 10.0f,
     .flowUnit = FLOW_UNIT_ML_MIN,
     .syringeDiameter_mm = 0.0f,
     .syringeName = "DEFAULT"
@@ -188,6 +194,7 @@ void RtosMenu_Init(void) {
 	DisableSelectButtonISR();
     /* Create the inter-task message queue (InputTask → UITask) */
     InputQueue = xQueueCreate(10, sizeof(InputMessage_t));
+    I2C2_Mutex = xSemaphoreCreateMutex();
 
     /* Initialize flash database and load saved syringe profiles */
     FlashStorage_Init();
@@ -1453,21 +1460,42 @@ void RtosMenu_TaskUI(void *argument) {
                         }
                         else {
                             /* --- User selected NO: RESUME the pump --- */
-                            gSysState = SYS_PUMPING;
-                            EnableSelectButtonISR();
-                            gMenuState = MENU_PUMPING_VIEW;
-                            HD44780_Clear();
-                            /* Restart the timer with acceleration from current state */
-                            gStepperControl.rampStepCounter = 0;
-                            gStepperControl.MotorState = MOTOR_STATE_ACCEL;
-                            gStepperControl.ARRCurrent = gStepperControl.accelLookupTable[0];
-                            
-                            __HAL_TIM_SET_AUTORELOAD(&htim2, gStepperControl.ARRCurrent);
-                            __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, gStepperControl.ARRCurrent / 2);
-                            TIM2->EGR |= TIM_EGR_UG;
-                            
-                            HAL_TIM_Base_Start_IT(&htim2);
-                            HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
+                            if (gStepperControl.totalStepsRemaining == 0) {
+                                /* The pump actually finished naturally right as we paused it! */
+                                gSysState = SYS_IDLE;
+                                DisableSelectButtonISR();
+                                gMenuState = MENU_PUMP_COMPLETED;
+                                stepper_set_spreadcycle(false);
+                                HD44780_Clear();
+                                HD44780_SetCursor(0, 0);
+                                HD44780_PrintStr("Pump Completed!");
+                                HD44780_SetCursor(0, 1);
+                                HD44780_PrintStr("Press any button");
+                                if (TaskInputHandle != NULL) vTaskResume(TaskInputHandle);
+                            } else {
+                                gSysState = SYS_PUMPING;
+                                EnableSelectButtonISR();
+                                gMenuState = MENU_PUMPING_VIEW;
+                                HD44780_Clear();
+                                
+                                /* Re-clamp acceleration steps if we paused very close to the end.
+                                 * This prevents the deceleration logic from getting out of sync. */
+                                if (gStepperControl.totalStepsRemaining < (2 * gStepperControl.accelSteps)) {
+                                    gStepperControl.accelSteps = gStepperControl.totalStepsRemaining / 2;
+                                }
+                                
+                                /* Restart the timer with acceleration from current state */
+                                gStepperControl.rampStepCounter = 0;
+                                gStepperControl.MotorState = MOTOR_STATE_ACCEL;
+                                gStepperControl.ARRCurrent = (uint32_t)((float)TIMER_CLOCK / ((PRESCALER + 1) * gStepperControl.startFreqHz)) - 1;
+                                
+                                __HAL_TIM_SET_AUTORELOAD(&htim2, gStepperControl.ARRCurrent);
+                                __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, gStepperControl.ARRCurrent / 2);
+                                TIM2->EGR |= TIM_EGR_UG;
+                                
+                                HAL_TIM_Base_Start_IT(&htim2);
+                                HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
+                            }
                         }
                     }
                     break;
@@ -1762,8 +1790,40 @@ void RtosMenu_TaskMotor(void *argument) {
     }
 }
 
+void RtosMenu_TaskEncoder(void* argument){
+    /* Wait for system to initialize */
+    vTaskDelay(pdMS_TO_TICKS(100));
+    if( I2C2_Mutex != NULL && xSemaphoreTake(I2C2_Mutex, pdMS_TO_TICKS(50)) == pdTRUE){
+		AS5600_Check_Magnet_Status();
+		xSemaphoreGive(I2C2_Mutex);
+    }
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+    const TickType_t xFrequency = pdMS_TO_TICKS(10);
+
+    for (;;) {
+        if (I2C2_Mutex != NULL) {
+            if (xSemaphoreTake(I2C2_Mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                /* Start non-blocking DMA read */
+                HAL_StatusTypeDef status = AS5600_Read_Angle();
+                
+                if (status == HAL_OK) {
+                        AS5600_Process_I2C_Buffer();
+                    }
+                else if(status == HAL_ERROR) {
+
+                	AS5600_I2C_Error_Handler();
+                }
+
+                /* Give back the mutex as soon as DMA is initiated/finished */
+                xSemaphoreGive(I2C2_Mutex);
+            }
+        }
+
+        /* Poll at an absolute 100 Hz (10 ms period), immune to execution time drift */
+        vTaskDelayUntil(&xLastWakeTime, xFrequency);
+    }
+}
 
 void vApplicationIdleHook(void) {
 
 }
-

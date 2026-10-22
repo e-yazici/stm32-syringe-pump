@@ -1,23 +1,39 @@
-Syringe_Pump.code-workspace
+# IDE & Workspace configurations
+*.code-workspace
 .project
 .cproject
 .settings
-.vscode
+.vscode/
 .metadata/
+.clangd
+
+# Compilation databases & Build outputs
+compile_commands.json
 build/
 Debug/
 Release/
+.cmake/
+CMakeCache.txt
+
+# Third-party & Probe scripts
 ThirdParty/SEGGER/
 *.SVPrj
 *.sysview/
 *.launch
 *.log
+*.jlink
+
+# Binary & Intermediate object files
 *.elf
+*.bin
+*.hex
 *.map
 *.o
 *.d
 *.ld
 *.cfg
-*.clangd
-.cmake/
-CmakeCache.txt
+
+# Agent & AI local configurations
+.agents/
+AGENTS.md
+GEMINI.md

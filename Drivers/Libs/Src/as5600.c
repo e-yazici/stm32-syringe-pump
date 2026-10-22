@@ -13,18 +13,25 @@
  *          - Q4 → Q1 crossing indicates a clockwise full revolution  → totalTurns++
  *          - Q1 → Q4 crossing indicates a counter-clockwise revolution → totalTurns--
  *
- * @note    Uses I2C1 with blocking HAL calls (HAL_MAX_DELAY). If the I2C bus
+ * @note    Uses I2C2 with blocking HAL calls (HAL_MAX_DELAY). If the I2C bus
  *          hangs, the driver attempts a peripheral re-init as recovery.
  */
 
 #include "as5600.h"
 #include "main.h"
+#include "math.h"
 
 /** @brief I2C1 handle (defined in i2c.c by CubeMX) */
-extern I2C_HandleTypeDef hi2c1;
+extern I2C_HandleTypeDef hi2c2;
 
 /** @brief Global encoder state — holds all raw and derived angle data */
-AS5600_Params_t EncoderParams;
+AS5600_Params_t gEncoderParams;
+
+/** @brief Buffer for DMA I2C reads */
+uint8_t gAS5600_I2C_RX_Buf[2];
+
+/** @brief EMA filter constant */
+#define AS5600_EMA_ALPHA 0.2f
 
 /** @brief Magnet detection status flags (set by AS5600_Check_Magnet_Status) */
 uint8_t magnet_detected;    ///< 1 if magnet is present and within range
@@ -43,12 +50,12 @@ uint8_t magnet_too_strong;  ///< 1 if magnet field exceeds threshold (too close)
  */
 void AS5600_Check_Magnet_Status(void){
 
-	HAL_I2C_Mem_Read(&hi2c1, AS5600_I2C_ADDR, 0x0B, 1, &EncoderParams.magnetStatus, 1, HAL_MAX_DELAY);
+	HAL_I2C_Mem_Read(&hi2c2, AS5600_I2C_ADDR, 0x0B, 1, &gEncoderParams.magnetStatus, 1, 5);
 
 	/* Extract individual status bits from the STATUS register byte */
-	magnet_detected = (EncoderParams.magnetStatus & 0x20) >> 5; /* Bit 5: MD — 1 if magnet is present */
-	magnet_too_weak = (EncoderParams.magnetStatus & 0x10) >> 4; /* Bit 4: ML — 1 if magnet is too far */
-	magnet_too_strong = (EncoderParams.magnetStatus & 0x08) >> 3; /* Bit 3: MH — 1 if magnet is too close */
+	magnet_detected = (gEncoderParams.magnetStatus & 0x20) >> 5; /* Bit 5: MD — 1 if magnet is present */
+	magnet_too_weak = (gEncoderParams.magnetStatus & 0x10) >> 4; /* Bit 4: ML — 1 if magnet is too far */
+	magnet_too_strong = (gEncoderParams.magnetStatus & 0x08) >> 3; /* Bit 3: MH — 1 if magnet is too close */
 }
 
 /**
@@ -63,27 +70,12 @@ void AS5600_Check_Magnet_Status(void){
  *
  *          On I2C error, the peripheral is re-initialized as a recovery attempt.
  */
-void AS5600_Read_Angle(void){
-
-	uint8_t rx_buf[2];
+HAL_StatusTypeDef AS5600_Read_Angle(void){
 
 	/* Burst read 2 bytes starting from RAW_ANGLE high register (0x0C) */
-	HAL_StatusTypeDef status = HAL_I2C_Mem_Read(&hi2c1, AS5600_I2C_ADDR, AS5600_RAW_11_8_BITS, I2C_MEMADD_SIZE_8BIT, rx_buf, 2, HAL_MAX_DELAY);
-	if (status == HAL_OK) {
-		EncoderParams.rawAngleHBits = rx_buf[0]; /* High nibble from register 0x0C */
-		EncoderParams.rawAngleLBits = rx_buf[1]; /* Low byte from register 0x0D */
+	HAL_StatusTypeDef status = HAL_I2C_Mem_Read(&hi2c2, AS5600_I2C_ADDR, AS5600_RAW_11_8_BITS, I2C_MEMADD_SIZE_8BIT, gAS5600_I2C_RX_Buf, 2, 5);
 
-		/* Assemble the 12-bit raw angle: mask off upper 4 bits of high byte */
-		EncoderParams.rawAngle = ((uint16_t)(EncoderParams.rawAngleHBits & 0x0F) << 8) | EncoderParams.rawAngleLBits;
-
-		/* Convert 12-bit count (0–4095) to degrees (0.0–360.0) */
-		EncoderParams.degreeAngle = (float)EncoderParams.rawAngle * AS5600_RAW_TO_DEGREE;
-	}
-	else{
-		/* I2C error recovery: attempt to re-initialize the peripheral */
-		HAL_I2C_Init(&hi2c1);
-	}
-
+	return status;
 }
 
 /**
@@ -95,11 +87,11 @@ void AS5600_Read_Angle(void){
  */
 void AS5600_Correct_Angle(void){
 
-	EncoderParams.correctedAngle = EncoderParams.degreeAngle - EncoderParams.startAngle;
+	gEncoderParams.correctedAngle = gEncoderParams.degreeAngle - gEncoderParams.startAngle;
 
 	/* Wrap negative values back into 0–360° range */
-	if(EncoderParams.correctedAngle < 0){
-		EncoderParams.correctedAngle += 360;
+	if(gEncoderParams.correctedAngle < 0){
+		gEncoderParams.correctedAngle += 360;
 	}
 	else{
 		__NOP(); /* No correction needed */
@@ -124,38 +116,104 @@ void AS5600_Correct_Angle(void){
  */
 void AS5600_Check_Quadrant(void){
 	/* Determine which 90° quadrant the corrected angle falls in */
-	if(EncoderParams.correctedAngle >= 0 && EncoderParams.correctedAngle < 90){
-		EncoderParams.prevQuadrant = EncoderParams.recentQuadrant;
-		EncoderParams.recentQuadrant = Quadrant_1;
+	if(gEncoderParams.correctedAngle >= 0 && gEncoderParams.correctedAngle < 90){
+		gEncoderParams.prevQuadrant = gEncoderParams.recentQuadrant;
+		gEncoderParams.recentQuadrant = Quadrant_1;
 	}
-	if(EncoderParams.correctedAngle >= 90 && EncoderParams.correctedAngle < 180){
-		EncoderParams.prevQuadrant = EncoderParams.recentQuadrant;
-		EncoderParams.recentQuadrant = Quadrant_2;
+	if(gEncoderParams.correctedAngle >= 90 && gEncoderParams.correctedAngle < 180){
+		gEncoderParams.prevQuadrant = gEncoderParams.recentQuadrant;
+		gEncoderParams.recentQuadrant = Quadrant_2;
 	}
-	if(EncoderParams.correctedAngle >= 180 && EncoderParams.correctedAngle < 270){
-		EncoderParams.prevQuadrant = EncoderParams.recentQuadrant;
-		EncoderParams.recentQuadrant = Quadrant_3;
+	if(gEncoderParams.correctedAngle >= 180 && gEncoderParams.correctedAngle < 270){
+		gEncoderParams.prevQuadrant = gEncoderParams.recentQuadrant;
+		gEncoderParams.recentQuadrant = Quadrant_3;
 	}
-	if(EncoderParams.correctedAngle >= 270 && EncoderParams.correctedAngle < 360){
-		EncoderParams.prevQuadrant = EncoderParams.recentQuadrant;
-		EncoderParams.recentQuadrant = Quadrant_4;
+	if(gEncoderParams.correctedAngle >= 270 && gEncoderParams.correctedAngle < 360){
+		gEncoderParams.prevQuadrant = gEncoderParams.recentQuadrant;
+		gEncoderParams.recentQuadrant = Quadrant_4;
 	}
 
 	/*
 	 * Detect full-revolution boundary crossings by checking for
 	 * transitions between Q4 and Q1 (the 360°/0° boundary).
 	 */
-	if(EncoderParams.prevQuadrant == Quadrant_4 && EncoderParams.recentQuadrant == Quadrant_1){
+	if(gEncoderParams.prevQuadrant == Quadrant_4 && gEncoderParams.recentQuadrant == Quadrant_1){
 		/* CW full revolution detected: Q4 → Q1 crossing (past 360°/0° boundary) */
-		EncoderParams.prevTurns = EncoderParams.totalTurns;
-		EncoderParams.totalTurns++;
+		gEncoderParams.prevTurns = gEncoderParams.totalTurns;
+		gEncoderParams.totalTurns++;
 	}
-	if(EncoderParams.prevQuadrant == Quadrant_1 && EncoderParams.recentQuadrant == Quadrant_4){
+	if(gEncoderParams.prevQuadrant == Quadrant_1 && gEncoderParams.recentQuadrant == Quadrant_4){
 		/* CCW full revolution detected: Q1 → Q4 crossing (past 0°/360° boundary) */
-		EncoderParams.prevTurns = EncoderParams.totalTurns;
-		EncoderParams.totalTurns--;
+		gEncoderParams.prevTurns = gEncoderParams.totalTurns;
+		gEncoderParams.totalTurns--;
 	}
 
 	/* Compute cumulative absolute angle across all revolutions */
-	EncoderParams.totalAngle = (EncoderParams.totalTurns * 360) + EncoderParams.correctedAngle;
+	gEncoderParams.totalAngle = (gEncoderParams.totalTurns * 360) + gEncoderParams.correctedAngle;
+}
+
+
+/**
+ * @brief  Process the 2 bytes received via DMA, update quadrant and apply filtering.
+ */
+void AS5600_Process_I2C_Buffer(void){
+	gEncoderParams.rawAngleHBits = gAS5600_I2C_RX_Buf[0];
+	gEncoderParams.rawAngleLBits = gAS5600_I2C_RX_Buf[1];
+
+	/* Assemble the 12-bit raw angle */
+	gEncoderParams.rawAngle = ((uint16_t)(gEncoderParams.rawAngleHBits & 0x0F) << 8) | gEncoderParams.rawAngleLBits;
+
+	/* Convert 12-bit count to degrees */
+	gEncoderParams.degreeAngle = (float)gEncoderParams.rawAngle * AS5600_RAW_TO_DEGREE;
+
+	/* Zero the encoder position on the very first read (after boot jerk) */
+	static uint8_t isBootInitialized = 0;
+	if (!isBootInitialized) {
+		gEncoderParams.startAngle = gEncoderParams.degreeAngle;
+		isBootInitialized = 1;
+	}
+
+	/* Apply zero-offset correction */
+	AS5600_Correct_Angle();
+
+	/* Check quadrant and calculate totalAngle */
+	AS5600_Check_Quadrant();
+
+	/* Initialize EMA filter on first read */
+	static uint8_t filterInitialized = 0;
+	if (!filterInitialized) {
+		gEncoderParams.filteredTotalAngle = (float)gEncoderParams.totalAngle;
+		filterInitialized = 1;
+	}
+	else {
+		// EMA with dynamic alpha
+		float error = fabs(gEncoderParams.totalAngle - gEncoderParams.filteredTotalAngle);
+
+		float dynamic_alpha;
+		if (error < 0.05f) {
+		    dynamic_alpha = 1.0f;
+		}
+		else {
+		    // Linear transition between 0.2 and 1.0
+		    dynamic_alpha = 0.2f;
+		}
+
+		gEncoderParams.filteredTotalAngle = (dynamic_alpha * (float)gEncoderParams.totalAngle) +
+		                                    ((1.0f - dynamic_alpha) * gEncoderParams.filteredTotalAngle);
+
+	}
+
+	float last_distance = gEncoderParams.travelledDistance_mm;
+	gEncoderParams.travelledDistance_mm = (gEncoderParams.filteredTotalAngle / 360.0f) * 2.0f;
+
+	/* Calculate and filter instantaneous velocity (assume 10ms update rate) */
+	float raw_velocity_mm_s = (gEncoderParams.travelledDistance_mm - last_distance) / 0.01f;
+	gEncoderParams.currentVelocity_mm_s = (0.1f * raw_velocity_mm_s) + (0.9f * gEncoderParams.currentVelocity_mm_s);
+}
+
+
+void AS5600_I2C_Error_Handler(void){
+	/* Bus recovery if error/timeout */
+	HAL_I2C_DeInit(&hi2c2);
+	HAL_I2C_Init(&hi2c2);
 }

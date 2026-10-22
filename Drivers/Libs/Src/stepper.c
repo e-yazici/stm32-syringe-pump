@@ -42,6 +42,7 @@
 /** @brief TIM2 handle (defined in tim.c by CubeMX). Used for stepper PWM output. */
 extern TIM_HandleTypeDef htim2;
 uint16_t node_id = 0xFFFF;
+float s_curve_norm[256];
 
 
 /**
@@ -64,6 +65,11 @@ void stepper_init(StepperControl_t *stepper)
     stepper->MotorState    = MOTOR_STATE_IDLE;
     stepper->MotorMode     = MOTOR_MODE_NONE;
     
+    /* Pre-compute normalized S-curve table (0.0 to 1.0) for interpolation */
+    for (uint32_t i = 0; i < 256; i++) {
+        s_curve_norm[i] = 0.5f * (1.0f - cosf((float)i * M_PI / 255.0f));
+    }
+
 
     uint32_t ioin = 0;
 
@@ -156,69 +162,6 @@ bool tmc2208_readWriteUART(uint16_t icID, uint8_t *data, size_t writeLength, siz
     return true;
 }
 
-/**
- * @brief  Generate an S-curve acceleration lookup table using cosine easing.
- * @param  stepper      Pointer to the StepperControl_t whose table will be populated.
- * @param  startFreqHz  Step frequency at the start of the ramp (Hz).
- * @param  cruiseFreqHz Step frequency at the end of the ramp (Hz).
- * @param  accelSteps   Number of entries (steps) in the ramp.
- *
- * @details The S-curve is generated using a cosine interpolation formula:
- *
- *          scale(i) = 0.5 * (1 - cos(i * PI / (N - 1)))
- *
- *          This maps each step index i (0..N-1) to a value between 0.0 and 1.0
- *          with smooth acceleration at both ends (zero jerk at start/finish).
- *          The frequency at each step is then:
- *
- *          freq(i) = startFreq + (cruiseFreq - startFreq) * scale(i)
- *
- *          Each frequency is converted to a timer ARR value:
- *
- *          ARR(i) = TIMER_CLOCK / ((PRESCALER + 1) * freq(i)) - 1
- *
- * @note   If accelSteps == 0, only a single entry at cruiseFreqHz is stored.
- *         If accelSteps > MAX_ACCEL_STEPS, the function returns without action.
- */
-static void generate_s_curve_profile(StepperControl_t *stepper,
-        float startFreqHz, float cruiseFreqHz, uint32_t accelSteps)
-{
-    /* Guard against buffer overflow */
-    if (accelSteps > MAX_ACCEL_STEPS) {
-        return;
-    }
-    
-    /* Special case: zero-length ramp — just store the cruise ARR */
-    if (accelSteps == 0) {
-        uint32_t arr = (uint32_t) ((float) TIMER_CLOCK / ((PRESCALER + 1) * cruiseFreqHz)) - 1;
-        stepper->accelLookupTable[0] = (uint16_t) arr;
-        return;
-    }
-
-    float freqChange = cruiseFreqHz - startFreqHz;
-
-    for (uint32_t i = 0; i < accelSteps; i++) {
-        /*
-         * Cosine easing: maps i from [0, N-1] to a scale factor [0.0, 1.0]
-         * in an S-curve shape. At i=0 scale≈0 (start), at i=N-1 scale=1.0 (cruise).
-         * The cosine provides zero-derivative at both endpoints (smooth start/stop).
-         */
-        float scale = 0.5f * (1.0f - cosf((float) i * M_PI / (accelSteps - 1)));
-
-        /* Interpolate between start and cruise frequencies */
-        float currentFreq = startFreqHz + (freqChange * scale);
-
-        /*
-         * Convert frequency (Hz) to timer Auto-Reload Register value:
-         *   ARR = (TimerClock / ((PSC + 1) * freq)) - 1
-         * The effective timer tick rate is TIMER_CLOCK / (PSC + 1) = 1 MHz,
-         * so ARR = 1,000,000 / freq - 1.
-         */
-        uint32_t arr = (uint32_t) ((float) TIMER_CLOCK / ((PRESCALER + 1) * currentFreq)) - 1;
-
-        stepper->accelLookupTable[i] = (uint16_t) arr;
-    }
-}
 
 /**
  * @brief  Compute the motion profile and start the stepper motor.
@@ -268,9 +211,8 @@ void stepper_start(StepperControl_t *stepper, float cruiseFreqHz,
         startFreq = cruiseFreqHz;
     }
 
-    /* Pre-compute the entire acceleration ramp into the lookup table */
-    generate_s_curve_profile(stepper, startFreq, cruiseFreqHz,
-            stepper->accelSteps);
+    stepper->startFreqHz = startFreq;
+    stepper->freqDiff = cruiseFreqHz - startFreq;
 
     /* --- Configure and Start Timer --- */
 
@@ -281,8 +223,8 @@ void stepper_start(StepperControl_t *stepper, float cruiseFreqHz,
     /* Set the prescaler (effective tick = TIMER_CLOCK / (PSC + 1) = 1 MHz) */
     __HAL_TIM_SET_PRESCALER(&htim2, PRESCALER);
 
-    /* Load the first ARR value from the lookup table (slowest speed) */
-    stepper->ARRCurrent = stepper->accelLookupTable[0];
+    /* Calculate the initial ARR value (slowest speed) */
+    stepper->ARRCurrent = (uint32_t)((float)TIMER_CLOCK / ((PRESCALER + 1) * startFreq)) - 1;
     __HAL_TIM_SET_AUTORELOAD(&htim2, stepper->ARRCurrent);
     /* 50% duty cycle: compare = ARR/2 produces a symmetric step pulse */
     __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, stepper->ARRCurrent / 2);

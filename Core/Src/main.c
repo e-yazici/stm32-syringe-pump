@@ -55,6 +55,7 @@
 volatile StepperControl_t gStepperControl = {.MotorMode = MOTOR_MODE_NONE,
         .MotorState = MOTOR_STATE_IDLE, };
 TaskHandle_t TaskInputHandle = NULL;
+TaskHandle_t TaskEncoderHandle = NULL;
 extern SystemState_e gSysState;
 extern QueueHandle_t InputQueue;
 /* USER CODE END PV */
@@ -99,11 +100,11 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
-  MX_I2C1_Init();
   MX_TIM1_Init();
   MX_TIM2_Init();
   MX_USART2_UART_Init();
   MX_USART1_UART_Init();
+  MX_I2C2_Init();
   /* USER CODE BEGIN 2 */
     HAL_TIM_Encoder_Start(&htim1, TIM_CHANNEL_ALL);
     stepper_init((StepperControl_t*) &gStepperControl);
@@ -119,6 +120,7 @@ int main(void)
 	xTaskCreate(RtosMenu_TaskInput, "InputTask", 128, NULL, 3, &TaskInputHandle);
 	xTaskCreate(RtosMenu_TaskUI, "UITask", 512, NULL, 2, NULL);
 	xTaskCreate(RtosMenu_TaskMotor, "MotorTask", 512, NULL, 4, NULL);
+	xTaskCreate(RtosMenu_TaskEncoder, "EncoderTask", 512, NULL, 4, &TaskEncoderHandle);
 
 	vTaskStartScheduler();
   /* USER CODE END 2 */
@@ -172,11 +174,11 @@ void SystemClock_Config(void)
     Error_Handler();
   }
   PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_USART1|RCC_PERIPHCLK_USART2
-                              |RCC_PERIPHCLK_I2C1|RCC_PERIPHCLK_TIM1
+                              |RCC_PERIPHCLK_I2C2|RCC_PERIPHCLK_TIM1
                               |RCC_PERIPHCLK_TIM2;
   PeriphClkInit.Usart1ClockSelection = RCC_USART1CLKSOURCE_PCLK2;
   PeriphClkInit.Usart2ClockSelection = RCC_USART2CLKSOURCE_PCLK1;
-  PeriphClkInit.I2c1ClockSelection = RCC_I2C1CLKSOURCE_HSI;
+  PeriphClkInit.I2c2ClockSelection = RCC_I2C2CLKSOURCE_HSI;
   PeriphClkInit.Tim1ClockSelection = RCC_TIM1CLK_HCLK;
   PeriphClkInit.Tim2ClockSelection = RCC_TIM2CLK_HCLK;
   if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
@@ -207,6 +209,18 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
       }
     }
   }
+}
+
+void HAL_I2C_MemRxCpltCallback(I2C_HandleTypeDef *hi2c)
+{
+    if (hi2c->Instance == I2C2)
+    {
+        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+        if (TaskEncoderHandle != NULL) {
+            vTaskNotifyGiveFromISR(TaskEncoderHandle, &xHigherPriorityTaskWoken);
+            portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+        }
+    }
 }
 /* USER CODE END 4 */
 
@@ -265,13 +279,26 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
         case MOTOR_STATE_ACCEL:
             gStepperControl.rampStepCounter++;
             if (gStepperControl.rampStepCounter >= gStepperControl.accelSteps) {
-                /* Acceleration complete — clamp ARR to the last (fastest) table entry */
-                gStepperControl.ARRCurrent = gStepperControl.accelLookupTable[gStepperControl.accelSteps - 1];
+                /* Acceleration complete — max frequency */
+                float currentFreq = gStepperControl.startFreqHz + gStepperControl.freqDiff;
+                gStepperControl.ARRCurrent = (uint32_t)((float)TIMER_CLOCK / ((PRESCALER + 1) * currentFreq)) - 1;
                 gStepperControl.MotorState = MOTOR_STATE_CRUISE;
             }
             else {
-                /* Still accelerating — read next ARR from lookup table */
-                gStepperControl.ARRCurrent = gStepperControl.accelLookupTable[gStepperControl.rampStepCounter];
+                /* Still accelerating — interpolate from s_curve_norm table */
+                float exact_index = ((float)gStepperControl.rampStepCounter * 255.0f) / (float)gStepperControl.accelSteps;
+                uint32_t index_int = (uint32_t)exact_index;
+                float fraction = exact_index - (float)index_int;
+
+                if (index_int >= 255) {
+                    index_int = 254;
+                    fraction = 1.0f;
+                }
+
+                float scale = s_curve_norm[index_int] + ((s_curve_norm[index_int + 1] - s_curve_norm[index_int]) * fraction);
+                float currentFreq = gStepperControl.startFreqHz + (gStepperControl.freqDiff * scale);
+                
+                gStepperControl.ARRCurrent = (uint32_t)((float)TIMER_CLOCK / ((PRESCALER + 1) * currentFreq)) - 1;
             }
 
             /* Early decel check: handles triangular profile (no cruise phase) */
@@ -302,9 +329,21 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
                 gStepperControl.rampStepCounter--;
             }
             
-            /* Read the corresponding ARR value from the lookup table */
+            /* Interpolate the corresponding ARR value from the lookup table */
             if (gStepperControl.rampStepCounter < gStepperControl.accelSteps) {
-                gStepperControl.ARRCurrent = gStepperControl.accelLookupTable[gStepperControl.rampStepCounter];
+                float exact_index = ((float)gStepperControl.rampStepCounter * 255.0f) / (float)gStepperControl.accelSteps;
+                uint32_t index_int = (uint32_t)exact_index;
+                float fraction = exact_index - (float)index_int;
+
+                if (index_int >= 255) {
+                    index_int = 254;
+                    fraction = 1.0f;
+                }
+
+                float scale = s_curve_norm[index_int] + ((s_curve_norm[index_int + 1] - s_curve_norm[index_int]) * fraction);
+                float currentFreq = gStepperControl.startFreqHz + (gStepperControl.freqDiff * scale);
+                
+                gStepperControl.ARRCurrent = (uint32_t)((float)TIMER_CLOCK / ((PRESCALER + 1) * currentFreq)) - 1;
             }
             break;
 

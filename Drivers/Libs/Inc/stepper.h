@@ -85,7 +85,9 @@ typedef struct{
 	uint32_t accelSteps;              ///< Number of steps allocated for acceleration (and deceleration)
 	uint32_t decelStartStep;          ///< Step count threshold at which deceleration begins
 	uint32_t rampStepCounter;         ///< Current index into the accelLookupTable during ramp phases
-	uint16_t accelLookupTable[MAX_ACCEL_STEPS]; ///< Pre-computed ARR values for the S-curve ramp profile
+	float startFreqHz;                ///< Starting frequency for the current move
+	float freqDiff;                   ///< Difference between cruise and start frequency
+
 
 	MotorState_e MotorState;          ///< Current state of the motor state machine
 	MotorMode_e  MotorMode;           ///< Current mode of the motor state machine, programmed or manual action
@@ -100,22 +102,7 @@ typedef struct{
  */
 void stepper_init(StepperControl_t* stepper);
 
-/**
- * @brief  Pre-compute the S-curve acceleration lookup table.
- * @param  stepper      Pointer to the StepperControl_t whose lookup table will be populated.
- * @param  startFreqHz  Starting step frequency in Hz (lowest speed).
- * @param  cruiseFreqHz Target cruise step frequency in Hz (highest speed).
- * @param  accelSteps   Number of steps over which to ramp from start to cruise.
- *
- * @details Uses a cosine easing function: scale = 0.5*(1 - cos(i*PI/(N-1)))
- *          to produce a smooth S-shaped velocity transition. The resulting
- *          frequency for each step is converted to an ARR value and stored
- *          in accelLookupTable[]. The same table is read in reverse for decel.
- *
- * @note   If accelSteps exceeds MAX_ACCEL_STEPS, the function returns early
- *         without modifying the table.
- */
-void stepper_generate_accel_curve(StepperControl_t* stepper, float startFreqHz, float cruiseFreqHz, uint32_t accelSteps);
+extern float s_curve_norm[256];
 
 /**
  * @brief  Compute the motion profile and start the stepper motor.

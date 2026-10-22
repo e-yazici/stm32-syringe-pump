@@ -17,6 +17,7 @@
 #define INC_AS5600_H_
 
 #include "stdint.h"
+#include "main.h"
 
 /** @defgroup AS5600_Registers AS5600 I2C Register Definitions
  *  @brief   I2C slave address and register map constants.
@@ -56,12 +57,14 @@ typedef struct{
 	uint8_t rawAngleHBits;             ///< Raw register byte from 0x0C (bits [3:0] valid)
 	float degreeAngle;                 ///< Raw angle converted to degrees (0.0–360.0)
 	float correctedAngle;              ///< Angle after zero-offset subtraction (0.0–360.0)
-	uint32_t totalAngle;               ///< Cumulative angle in degrees (turns * 360 + corrected)
-	uint32_t totalTurns;               ///< Number of complete revolutions (increments/decrements on Q4↔Q1 crossing)
-	uint32_t prevTurns;                ///< Previous turn count (for edge-detection logic)
+	int32_t totalAngle;                ///< Cumulative angle in degrees (turns * 360 + corrected)
+	int32_t totalTurns;                ///< Number of complete revolutions (increments/decrements on Q4↔Q1 crossing)
+	int32_t prevTurns;                 ///< Previous turn count (for edge-detection logic)
 	AS5600_Quadrant_e recentQuadrant;  ///< Current quadrant based on correctedAngle
 	AS5600_Quadrant_e prevQuadrant;    ///< Previous quadrant (used for crossing detection)
-
+	float filteredTotalAngle;          ///< EMA filtered total angle
+	float travelledDistance_mm;        ///< Distance calculated from the filtered angle
+	float currentVelocity_mm_s;
 }AS5600_Params_t;
 
 /**
@@ -77,13 +80,13 @@ typedef struct{
 void AS5600_Check_Magnet_Status(void);
 
 /**
- * @brief  Read the raw 12-bit angle from the AS5600 and convert to degrees.
+ * @brief  Read the raw 12-bit angle from the AS5600
  *
  * @details Performs a 2-byte I2C read from registers 0x0C–0x0D, assembles the
- *          12-bit value, and converts to degrees using AS5600_RAW_TO_DEGREE.
- *          On I2C failure, re-initializes the I2C peripheral as a recovery attempt.
+ *          12-bit value
+ * @return HAL_StatusTypeDef (HAL_OK if started successfully)
  */
-void AS5600_Read_Angle(void);
+HAL_StatusTypeDef AS5600_Read_Angle(void);
 
 /**
  * @brief  Apply zero-offset correction to the raw degree angle.
@@ -104,5 +107,12 @@ void AS5600_Correct_Angle(void);
  *          Updates totalAngle = totalTurns * 360 + correctedAngle.
  */
 void AS5600_Check_Quadrant(void);
+
+/**
+ * @brief  Process the 2 bytes received via DMA, update quadrant and apply filtering.
+ */
+void AS5600_Process_I2C_Buffer(void);
+
+void AS5600_I2C_Error_Handler(void);
 
 #endif /* INC_AS5600_H_ */

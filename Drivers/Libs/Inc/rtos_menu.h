@@ -173,4 +173,10 @@ void RtosMenu_TaskUI(void *argument);
  */
 void RtosMenu_TaskMotor(void *argument);
 
+/**
+ * @brief AS5600 Encoder Task.
+ *        Convert angle values to distance, compare the position with remaining/traveled distance.
+ */
+void RtosMenu_TaskEncoder(void* argument);
+
 #endif /* LIBS_INC_RTOS_MENU_H_ */

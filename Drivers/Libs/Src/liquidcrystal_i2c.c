@@ -26,7 +26,7 @@
  *          microsecond delays use the ARM DWT cycle counter. Once FreeRTOS is
  *          running, delays >= 1 ms use vTaskDelay() to yield the CPU.
  *
- * @note    Uses I2C1 peripheral handle (hi2c1).
+ * @note    Uses I2C1 peripheral handle (hi2c2).
  *          Two custom characters are pre-loaded into CGRAM slots 0 and 1
  *          during initialization.
  */
@@ -35,8 +35,11 @@
 #include "FreeRTOS.h"
 #include "task.h"
 
-/** @brief I2C1 handle (defined in i2c.c by CubeMX) */
-extern I2C_HandleTypeDef hi2c1;
+#include "task.h"
+#include "semphr.h"
+
+extern I2C_HandleTypeDef hi2c2;
+extern SemaphoreHandle_t I2C2_Mutex;
 
 /* -------------------------------------------------------------------------- */
 /*                           Module-Level State                               */
@@ -95,63 +98,61 @@ uint8_t special2[8] = {0b11000, 0b11000, 0b00110, 0b01001,
  *          6. Return cursor to home position.
  */
 void HD44780_Init(uint8_t rows) {
-  dpRows = rows;
+	dpRows = rows;
 
-  dpBacklight = LCD_BACKLIGHT;
+	dpBacklight = LCD_BACKLIGHT;
 
-  dpFunction = LCD_4BITMODE | LCD_1LINE | LCD_5x8DOTS;
+	dpFunction = LCD_4BITMODE | LCD_1LINE | LCD_5x8DOTS;
 
-  if (dpRows > 1) {
-    dpFunction |= LCD_2LINE;
-  } else {
-    dpFunction |= LCD_5x10DOTS;
-  }
+	if (dpRows > 1) {
+	dpFunction |= LCD_2LINE;
+	} else {
+	dpFunction |= LCD_5x10DOTS;
+	}
 
-  /* Initialize DWT cycle counter for microsecond-precision delays */
-  DelayInit();
-  /* HD44780 requires >40 ms delay after power-on before any commands */
-  HAL_Delay(50);
+	/* Initialize DWT cycle counter for microsecond-precision delays */
+	DelayInit();
+	/* HD44780 requires >40 ms delay after power-on before any commands */
+	HAL_Delay(50);
+	/* Send backlight state to PCF8574 (wake up the I2C expander) */
+	ExpanderWrite(dpBacklight);
+	HAL_Delay(1000);
+	/*
+	* HD44780 initialization-by-instruction sequence (datasheet Figure 24):
+	* Must send 0x03 three times to reliably reset the controller to 8-bit mode,
+	* regardless of what state it was previously in.
+	*/
+	Write4Bits(0x03 << 4);  /* First attempt: set to 8-bit mode */
+	DelayUS(4500);           /* Wait >4.1 ms */
 
-  /* Send backlight state to PCF8574 (wake up the I2C expander) */
-  ExpanderWrite(dpBacklight);
-  HAL_Delay(1000);
+	Write4Bits(0x03 << 4);  /* Second attempt */
+	DelayUS(4500);           /* Wait >4.1 ms */
 
-  /*
-   * HD44780 initialization-by-instruction sequence (datasheet Figure 24):
-   * Must send 0x03 three times to reliably reset the controller to 8-bit mode,
-   * regardless of what state it was previously in.
-   */
-  Write4Bits(0x03 << 4);  /* First attempt: set to 8-bit mode */
-  DelayUS(4500);           /* Wait >4.1 ms */
+	Write4Bits(0x03 << 4);  /* Third attempt */
+	DelayUS(4500);           /* Wait >100 µs (using 4500 for margin) */
 
-  Write4Bits(0x03 << 4);  /* Second attempt */
-  DelayUS(4500);           /* Wait >4.1 ms */
+	/* Now switch to 4-bit mode: send 0x02 as a single nibble */
+	Write4Bits(0x02 << 4);
+	DelayUS(100);
 
-  Write4Bits(0x03 << 4);  /* Third attempt */
-  DelayUS(4500);           /* Wait >100 µs (using 4500 for margin) */
+	/* Configure function set: 4-bit, N lines, 5×8 font */
+	SendCommand(LCD_FUNCTIONSET | dpFunction);
 
-  /* Now switch to 4-bit mode: send 0x02 as a single nibble */
-  Write4Bits(0x02 << 4);
-  DelayUS(100);
+	/* Turn display ON, cursor OFF, blink OFF */
+	dpControl = LCD_DISPLAYON | LCD_CURSOROFF | LCD_BLINKOFF;
+	HD44780_Display();
+	HD44780_Clear();
 
-  /* Configure function set: 4-bit, N lines, 5×8 font */
-  SendCommand(LCD_FUNCTIONSET | dpFunction);
+	/* Set entry mode: cursor moves left-to-right, no display shift */
+	dpMode = LCD_ENTRYLEFT | LCD_ENTRYSHIFTDECREMENT;
+	SendCommand(LCD_ENTRYMODESET | dpMode);
+	DelayUS(4500);
 
-  /* Turn display ON, cursor OFF, blink OFF */
-  dpControl = LCD_DISPLAYON | LCD_CURSOROFF | LCD_BLINKOFF;
-  HD44780_Display();
-  HD44780_Clear();
+	/* Load custom characters into CGRAM slots 0 and 1 */
+	HD44780_CreateSpecialChar(0, special1);
+	HD44780_CreateSpecialChar(1, special2);
 
-  /* Set entry mode: cursor moves left-to-right, no display shift */
-  dpMode = LCD_ENTRYLEFT | LCD_ENTRYSHIFTDECREMENT;
-  SendCommand(LCD_ENTRYMODESET | dpMode);
-  DelayUS(4500);
-
-  /* Load custom characters into CGRAM slots 0 and 1 */
-  HD44780_CreateSpecialChar(0, special1);
-  HD44780_CreateSpecialChar(1, special2);
-
-  HD44780_Home();
+	HD44780_Home();
 }
 
 /**
@@ -159,8 +160,8 @@ void HD44780_Init(uint8_t rows) {
  * @note   The clear command takes ~1.52 ms to execute on the HD44780.
  */
 void HD44780_Clear() {
-  SendCommand(LCD_CLEARDISPLAY);
-  DelayUS(2000);  /* HD44780 needs ~1.52 ms to process clear */
+		SendCommand(LCD_CLEARDISPLAY);
+		DelayUS(2000);  /* HD44780 needs ~1.52 ms to process clear */
 }
 
 /**
@@ -362,8 +363,8 @@ static void Send(uint8_t value, uint8_t mode) {
  *          then pulses the Enable pin to latch the data into the HD44780.
  */
 static void Write4Bits(uint8_t value) {
-  ExpanderWrite(value);
-  PulseEnable(value);
+		ExpanderWrite(value);
+		PulseEnable(value);
 }
 
 /**
@@ -375,7 +376,13 @@ static void Write4Bits(uint8_t value) {
  */
 static void ExpanderWrite(uint8_t _data) {
   uint8_t data = _data | dpBacklight;
-  HAL_I2C_Master_Transmit(&hi2c1, DEVICE_ADDR, (uint8_t *)&data, 1, 10);
+  if (I2C2_Mutex != NULL) {
+      xSemaphoreTake(I2C2_Mutex, portMAX_DELAY);
+  }
+  HAL_I2C_Master_Transmit(&hi2c2, DEVICE_ADDR, (uint8_t *)&data, 1, 10);
+  if (I2C2_Mutex != NULL) {
+      xSemaphoreGive(I2C2_Mutex);
+  }
 }
 
 /**
