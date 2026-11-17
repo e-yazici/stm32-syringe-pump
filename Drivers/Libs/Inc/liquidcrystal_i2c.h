@@ -24,7 +24,7 @@
  *          - P3 = BL  (Backlight control, active-high)
  *          - P4–P7 = D4–D7 (4-bit data bus)
  *
- * @note    Uses I2C1 peripheral handle (hi2c1, defined externally).
+ * @note    Uses I2C2 peripheral handle (hi2c2, defined externally).
  *          Microsecond delays are implemented via the ARM DWT cycle counter
  *          when the RTOS scheduler is not yet running, and via vTaskDelay()
  *          once FreeRTOS is active.
@@ -110,7 +110,7 @@
 #define RS 0x01      ///< Register Select bit (P0) — 0 = command, 1 = data
 /** @} */
 
-/** @brief PCF8574 I2C slave address (7-bit = 0x3F, left-shifted for HAL) */
+/** @brief PCF8574 I2C slave address (7-bit = 0x27, left-shifted for HAL) */
 #define DEVICE_ADDR     (0x27 << 1)
 
 /* -------------------------------------------------------------------------- */

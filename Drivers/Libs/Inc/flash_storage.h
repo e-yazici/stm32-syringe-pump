@@ -19,34 +19,7 @@
 
 #include "main.h"
 #include <stdbool.h>
-
-#define MAX_SAVED_SYRINGES 10    ///< Maximum number of syringe profiles that can be stored
-#define SYRINGE_NAME_LEN   16    ///< Maximum length of a syringe name string (including null terminator)
-
-/**
- * @brief  Single syringe profile with physical dimensions.
- *
- * @details Stores the user-defined parameters needed to calculate linear
- *          displacement and flow rate for a specific syringe model.
- */
-typedef struct {
-    char name[SYRINGE_NAME_LEN];    ///< Human-readable identifier (null-terminated, e.g. "BD 10ML")
-    float maxVolume_ml;             ///< Maximum syringe capacity in milliliters
-    float innerDiameter_mm;         ///< Inner barrel diameter in millimeters (used for area calculation)
-} SyringeProfile_t;
-
-/**
- * @brief  Flash-resident database header and profile array.
- *
- * @details This structure is memory-mapped directly to the flash page at
- *          FLASH_DB_ADDR. The magic word is checked at startup to determine
- *          whether the flash contains valid data or needs formatting.
- */
-typedef struct {
-    uint32_t magic; ///< Validation marker; must equal 0xABCD1234 for valid data
-    uint32_t count; ///< Number of syringe profiles currently stored (0 to MAX_SAVED_SYRINGES)
-    SyringeProfile_t syringes[MAX_SAVED_SYRINGES]; ///< Array of saved syringe profiles
-} SyringeDatabase_t;
+#include "syringe_db.h"
 
 /**
  * @brief  Initialize the flash storage subsystem.
@@ -60,6 +33,10 @@ typedef struct {
  */
 void FlashStorage_Init(void);
 
+/** @brief Start address of the database in flash (last page) */
+/* Base address of Page 255 (last 2 KB flash sector in STM32F303RE 512 KB memory map) */
+#define FLASH_DB_ADDR 0x0807F800
+
 /**
  * @brief  Get a read-only pointer to the flash-resident database.
  * @retval Pointer to the SyringeDatabase_t mapped at FLASH_DB_ADDR.
@@ -67,7 +44,10 @@ void FlashStorage_Init(void);
  * @note   The returned pointer points directly to flash memory. Do not attempt
  *         to write through this pointer — use FlashStorage_AddSyringe() instead.
  */
-SyringeDatabase_t* FlashStorage_GetDB(void);
+static inline const SyringeDatabase_t* FlashStorage_GetDB(void) {
+    /* Zero-copy access: internal flash is memory-mapped into Cortex-M address space */
+    return (const SyringeDatabase_t*)FLASH_DB_ADDR;
+}
 
 /**
  * @brief  Append a new syringe profile to the database.

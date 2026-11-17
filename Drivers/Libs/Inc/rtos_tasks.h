@@ -1,22 +1,24 @@
 /**
- * @file    rtos_menu.h
- * @brief   Public interface and data structures for the Syringe Pump RTOS architecture.
+ * @file    rtos_tasks.h
+ * @brief   Public interface and data structures for the Syringe Pump RTOS tasks.
  * @author  eyazici
  * @date    2026
  *
- * @details This file defines the state machine components, input events, and data
- *          structures used by the UI, Input, and Motor tasks. It serves as the
- *          single source of truth for shared system structures to avoid coupling
- *          between modules.
+ * @details This file defines the system state components, input events, and data
+ *          structures used by the Input, UI, Motor, Encoder, and UART FreeRTOS tasks.
+ *          It serves as the single source of truth for shared system structures
+ *          to avoid coupling between modules.
  *
- *          The system uses a 3-task FreeRTOS architecture:
+ *          The system uses a 5-task FreeRTOS architecture:
  *          - **InputTask** (50 Hz): Polls encoder + buttons, emits InputMessage_t to queue
- *          - **UITask**: Blocks on InputQueue, drives the LCD menu state machine
+ *          - **UITask**: Blocks on InputQueue, delegates LCD menu pages to ui_menu
  *          - **MotorTask**: Computes kinematics and supervises stepper execution
+ *          - **EncoderTask** (100 Hz): Reads AS5600 magnetic encoder over I2C2
+ *          - **UartTask**: Serializes USART1 TMC2208 DMA and USART2 VCP DMA transactions
  */
 
-#ifndef LIBS_INC_RTOS_MENU_H_
-#define LIBS_INC_RTOS_MENU_H_
+#ifndef LIBS_INC_RTOS_TASKS_H_
+#define LIBS_INC_RTOS_TASKS_H_
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -28,9 +30,9 @@
  *        These values are largely set once and used mathematically.
  */
 typedef struct {
-    float screwLead_mm_per_rev;    ///< Distance output shaft travels per revolution in mm (e.g. 2.0 for M5 lead screw)
+    float screwLead_mm_per_rev;    ///< Distance output shaft travels per revolution in mm (e.g. 2.0 for T8 lead screw)
     uint16_t motorStepsPerRev;     ///< Full steps per revolution of the motor (e.g. 200 for 1.8° stepper)
-    uint16_t microstepping;        ///< Active driver microstep setting (e.g. 16)
+    uint16_t microstepping;        ///< Active driver microstep setting (e.g. 128)
     float maxFlowRate_ul_min;      ///< Theoretical maximum flow rate in µL/min
     float maxFlowRate_ml_min;      ///< Theoretical maximum flow rate in mL/min
 } PumpHardwareSpecs_t;
@@ -76,9 +78,8 @@ typedef enum {
     SYS_IDLE,                     ///< User is configuring menu, motor idle
     SYS_PUMPING,                  ///< Motor is currently running
     SYS_PUMPING_CALIBRATION,      ///< Motor is pumping fixed distance for calibration (diameter finder)
-    SYS_PAUSED,                   ///< Motor halted by user, can be resumed
-    SYS_FAULT_LIMIT_SWITCH,    ///< Hard stop: absolute limit reached, must retract. @todo Implement this state in the state machine.
-    SYS_FAULT_CLOG    ///< Hard stop: overload detected, but can be manually resumed. @todo Implement this state in the state machine.
+    SYS_PAUSED                    ///< Motor halted by user, can be resumed
+
 } SystemState_e;
 
 /**
@@ -97,6 +98,7 @@ typedef enum {
     MENU_ADD_SYRINGE_AUTO_PROMPT,     ///< Prompt user to fill syringe
     MENU_ADD_SYRINGE_AUTO_PUMPING,    ///< Motor running calibration distance
     MENU_ADD_SYRINGE_AUTO_WEIGHT,     ///< Enter weight of pumped water
+    MENU_ADD_SYRINGE_AUTO_Z_FACTOR,   ///< Enter ISO 8655 Z-factor for gravimetric calibration
     MENU_ADD_SYRINGE_DIA,             ///< Add new syringe - diameter setup
     MENU_ADD_SYRINGE_VOL,             ///< Add new syringe - Volume
     MENU_ADD_SYRINGE_NAME,            ///< Add new syringe - name setup
@@ -107,7 +109,8 @@ typedef enum {
     MENU_PUMP_COMPLETED,              ///< Static info screen on natural finish
     MENU_PUMP_CANCELLED,              ///< Static info screen on manual abort
     MENU_FREE_MOVE_VIEW,              ///< Manual motor control screen
-    MENU_EDIT_DIRECTION               ///< Select motor direction
+    MENU_EDIT_DIRECTION,              ///< Select motor direction
+    MENU_STALL_ALERT                  ///< Motor stall alert dialog (Continue / Abort)
 } MenuState_e;
 
 /**
@@ -138,7 +141,8 @@ typedef enum {
     EVENT_BTN_CURSOR_RIGHT_PRESS,
     EVENT_BTN_CURSOR_RIGHT_RELEASE,
     EVENT_LIMIT_SW_TRIGGERED,          ///< @todo Implement this state in the state machine
-    EVENT_MOTOR_COMPLETE
+    EVENT_MOTOR_COMPLETE,
+    EVENT_STALL_DETECTED              ///< Closed-loop supervisor confirmed motor stall
 } InputEvent_e;
 
 /**
@@ -150,33 +154,51 @@ typedef struct {
 } InputMessage_t;
 
 
+extern PumpHardwareSpecs_t gPumpHw;
+extern PumpJobParams_t gPumpJob;
+extern volatile SystemState_e gSysState;
+extern volatile float gLivePumpedVolume_ml;
+
 /**
  * @brief Initialize local parameters (Must be called before OS starts)
  */
-void RtosMenu_Init(void);
+void RtosTasks_Init(void);
 
 /**
  * @brief Lightweight polling task (50Hz) to read hardware encoder & switches.
  *        Pushes `InputMessage_t` to the InputQueue.
  */
-void RtosMenu_TaskInput(void *argument);
+void RtosTasks_TaskInput(void *argument);
 
 /**
  * @brief Heavyweight UI state machine task.
  *        Sleeps perpetually until an Input Event arrives via InputQueue.
  */
-void RtosMenu_TaskUI(void *argument);
+void RtosTasks_TaskUI(void *argument);
 
 /**
  * @brief Motor Supervisor Task.
  *        Listens for start/stop commands and computes acceleration physics.
  */
-void RtosMenu_TaskMotor(void *argument);
+void RtosTasks_TaskMotor(void *argument);
 
 /**
- * @brief AS5600 Encoder Task.
- *        Convert angle values to distance, compare the position with remaining/traveled distance.
+ * @brief AS5600 Encoder Task (100 Hz).
+ *        Reads the AS5600 angle over I2C2, filters angle and velocity, and updates the odometry snapshot.
  */
-void RtosMenu_TaskEncoder(void* argument);
+void RtosTasks_TaskEncoder(void* argument);
 
-#endif /* LIBS_INC_RTOS_MENU_H_ */
+/**
+ * @brief UART Gatekeeper Task (USART1 TMC2208 DMA & USART2 VCP DMA).
+ */
+void RtosTasks_TaskUartGatekeeper(void *argument);
+
+/**
+ * @brief Enqueue an asynchronous diagnostic buffer for transmission over USART2 (VCP) via DMA.
+ * @param data Pointer to bytes to transmit.
+ * @param len  Number of bytes to transmit (clamped to internal VCP payload size).
+ * @return true if successfully queued to the UART Gatekeeper task.
+ */
+bool RtosTasks_UartSendVcpAsync(const uint8_t *data, uint16_t len);
+
+#endif /* LIBS_INC_RTOS_TASKS_H_ */

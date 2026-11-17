@@ -64,6 +64,7 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
 # Add project symbols (macros)
 target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined symbols
+    CLOSED_LOOP_TEST=$<IF:$<CONFIG:Debug>,1,0>
 )
 
 # Remove wrong libob.a library dependency when using cpp files

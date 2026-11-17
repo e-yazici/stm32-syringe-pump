@@ -54,6 +54,7 @@ extern bool tmc2208_readWriteUART(uint16_t icID, uint8_t *data, size_t writeLeng
 extern uint8_t tmc2208_getNodeAddress(uint16_t icID);
 // => TMC-API wrapper
 
+bool tmc2208_readRegisterChecked(uint16_t icID, uint8_t address, int32_t *outValue);
 int32_t tmc2208_readRegister(uint16_t icID, uint8_t address);
 void tmc2208_writeRegister(uint16_t icID, uint8_t address, int32_t value);
 

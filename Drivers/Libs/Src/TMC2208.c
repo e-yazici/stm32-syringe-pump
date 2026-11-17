@@ -117,30 +117,50 @@ extern bool tmc2208_cache(uint16_t icID, TMC2208CacheOp operation, uint8_t addre
 
 /************************************************************** Register read / write Implementation ******************************************************************/
 
-static int32_t readRegisterUART(uint16_t icID, uint8_t registerAddress);
+static bool readRegisterUART(uint16_t icID, uint8_t registerAddress, int32_t *outValue);
 static void writeRegisterUART(uint16_t icID, uint8_t registerAddress, int32_t value);
 static uint8_t CRC8(uint8_t *data, uint32_t bytes);
 
-int32_t tmc2208_readRegister(uint16_t icID, uint8_t address)
+bool tmc2208_readRegisterChecked(uint16_t icID, uint8_t address, int32_t *outValue)
 {
-    uint32_t value;
+    uint32_t value = 0;
+
+    if (outValue == NULL) {
+        return false;
+    }
 
     // Read from cache for registers with write-only access
-    if (tmc2208_cache(icID, TMC2208_CACHE_READ, address, &value))
-        return value;
+    if (tmc2208_cache(icID, TMC2208_CACHE_READ, address, &value)) {
+        *outValue = (int32_t)value;
+        return true;
+    }
 
-    return readRegisterUART(icID, address);
-
-    // ToDo: Error handling
+    return readRegisterUART(icID, address, outValue);
 }
+
+int32_t tmc2208_readRegister(uint16_t icID, uint8_t address)
+{
+    int32_t value = 0;
+
+    if (!tmc2208_readRegisterChecked(icID, address, &value)) {
+        return 0;
+    }
+
+    return value;
+}
+
 void tmc2208_writeRegister(uint16_t icID, uint8_t address, int32_t value)
 {
     writeRegisterUART(icID, address, value);
 }
 
-int32_t readRegisterUART(uint16_t icID, uint8_t registerAddress)
+static bool readRegisterUART(uint16_t icID, uint8_t registerAddress, int32_t *outValue)
 {
     uint8_t data[8] = {0};
+
+    if (outValue == NULL) {
+        return false;
+    }
 
     registerAddress = registerAddress & TMC2208_ADDRESS_MASK;
 
@@ -149,48 +169,56 @@ int32_t readRegisterUART(uint16_t icID, uint8_t registerAddress)
     data[2] = registerAddress;
     data[3] = CRC8(data, 3);
 
-    if (!tmc2208_readWriteUART(icID, &data[0], 4, 8))
-        return 0;
+    if (!tmc2208_readWriteUART(icID, &data[0], 4, 8)) {
+        return false;
+    }
 
     // Byte 0: Sync nibble correct?
-    if (data[0] != 0x05)
-        return 0;
+    if (data[0] != 0x05) {
+        return false;
+    }
 
     // Byte 1: Master address correct?
-    if (data[1] != 0xFF)
-        return 0;
+    if (data[1] != 0xFF) {
+        return false;
+    }
 
     // Byte 2: Address correct?
-    if (data[2] != registerAddress)
-        return 0;
+    if (data[2] != registerAddress) {
+        return false;
+    }
 
     // Byte 7: CRC correct?
-    if (data[7] != CRC8(data, 7))
-        return 0;
+    if (data[7] != CRC8(data, 7)) {
+        return false;
+    }
 
-    return    ((uint32_t) data[3] << 24)
+    *outValue = (int32_t)(((uint32_t) data[3] << 24)
             | ((uint32_t) data[4] << 16)
             | ((uint32_t) data[5] << 8)
-            | ((uint32_t) data[6]);
+            | ((uint32_t) data[6]));
+
+    return true;
 }
 
-void writeRegisterUART(uint16_t icID, uint8_t registerAddress, int32_t value)
+static void writeRegisterUART(uint16_t icID, uint8_t registerAddress, int32_t value)
 {
     uint8_t data[8];
 
     data[0] = 0x05;
     data[1] = tmc2208_getNodeAddress(icID);
     data[2] = registerAddress | TMC2208_WRITE_BIT;
-    data[3] = (value >> 24) & 0xFF;
-    data[4] = (value >> 16) & 0xFF;
-    data[5] = (value >> 8) & 0xFF;
-    data[6] = (value) & 0xFF;
+    data[3] = (uint8_t)((value >> 24) & 0xFF);
+    data[4] = (uint8_t)((value >> 16) & 0xFF);
+    data[5] = (uint8_t)((value >> 8) & 0xFF);
+    data[6] = (uint8_t)(value & 0xFF);
     data[7] = CRC8(data, 7);
 
     tmc2208_readWriteUART(icID, &data[0], 8, 0);
 
     //Cache the registers with write-only access
-    tmc2208_cache(icID, TMC2208_CACHE_WRITE, registerAddress, (uint32_t *)&value);
+    uint32_t uvalue = (uint32_t)value;
+    tmc2208_cache(icID, TMC2208_CACHE_WRITE, registerAddress, &uvalue);
 }
 
 static uint8_t CRC8(uint8_t *data, uint32_t bytes)

@@ -18,6 +18,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "dma.h"
 #include "i2c.h"
 #include "tim.h"
 #include "usart.h"
@@ -28,7 +29,7 @@
 #include "FreeRTOS.h"
 #include "task.h"
 #include "queue.h"
-#include "rtos_menu.h"
+#include "rtos_tasks.h"
 #include "stepper.h"
 #include "liquidcrystal_i2c.h"
 /* USER CODE END Includes */
@@ -55,15 +56,17 @@
 volatile StepperControl_t gStepperControl = {.MotorMode = MOTOR_MODE_NONE,
         .MotorState = MOTOR_STATE_IDLE, };
 TaskHandle_t TaskInputHandle = NULL;
-TaskHandle_t TaskEncoderHandle = NULL;
-extern SystemState_e gSysState;
+TaskHandle_t TaskUartGatekeeperHandle = NULL;
+extern volatile SystemState_e gSysState;
 extern QueueHandle_t InputQueue;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
-
+/* Enforce -O2 optimization even in Debug builds (-O0) to prevent ISR cycle bloat
+ * and CPU starvation of lower-priority FreeRTOS tasks (TaskEncoder, TaskInput). */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) __attribute__((optimize("O2")));
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -100,6 +103,7 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_TIM1_Init();
   MX_TIM2_Init();
   MX_USART2_UART_Init();
@@ -109,18 +113,21 @@ int main(void)
     HAL_TIM_Encoder_Start(&htim1, TIM_CHANNEL_ALL);
     stepper_init((StepperControl_t*) &gStepperControl);
     HD44780_Init(2);
-    RtosMenu_Init();
+    RtosTasks_Init();
 
 	/*
-	 * Create the three FreeRTOS tasks:
-	 *   InputTask (prio 3): 50 Hz GPIO/encoder polling → produces input events
-	 *   UITask    (prio 2): Event-driven LCD menu state machine
-	 *   MotorTask (prio 4): Kinematics computation and pump monitoring
+	 * Create the FreeRTOS tasks:
+	 *   InputTask   (prio 3): 50 Hz GPIO/encoder polling → produces input events
+	 *   UITask      (prio 2): Event-driven LCD menu state machine
+	 *   MotorTask   (prio 4): Kinematics computation and pump monitoring
+	 *   EncoderTask (prio 4): I2C AS5600 encoder reading and processing
+	 *   UartTask    (prio 4): UART Gatekeeper (TMC2208 & VCP DMA)
 	 */
-	xTaskCreate(RtosMenu_TaskInput, "InputTask", 128, NULL, 3, &TaskInputHandle);
-	xTaskCreate(RtosMenu_TaskUI, "UITask", 512, NULL, 2, NULL);
-	xTaskCreate(RtosMenu_TaskMotor, "MotorTask", 512, NULL, 4, NULL);
-	xTaskCreate(RtosMenu_TaskEncoder, "EncoderTask", 512, NULL, 4, &TaskEncoderHandle);
+	xTaskCreate(RtosTasks_TaskInput, "InputTask", 128, NULL, 3, &TaskInputHandle);
+	xTaskCreate(RtosTasks_TaskUI, "UITask", 512, NULL, 2, NULL);
+	xTaskCreate(RtosTasks_TaskMotor, "MotorTask", 512, NULL, 4, NULL);
+	xTaskCreate(RtosTasks_TaskEncoder, "EncoderTask", 512, NULL, 4, NULL);
+	xTaskCreate(RtosTasks_TaskUartGatekeeper, "UartTask", 256, NULL, 4, &TaskUartGatekeeperHandle);
 
 	vTaskStartScheduler();
   /* USER CODE END 2 */
@@ -194,8 +201,12 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
   {
     if (HAL_GPIO_ReadPin(buttonSelect_GPIO_Port, buttonSelect_Pin) == GPIO_PIN_RESET)
     {
+      /* While TaskInput is suspended during pumping, EXTI provides zero-latency pause detection */
       if (gSysState == SYS_PUMPING || gSysState == SYS_PUMPING_CALIBRATION)
       {
+        /* Immediately mask EXTI line so contact bounce cannot queue multiple pause events */
+        EXTI->IMR &= ~buttonSelect_Pin;
+
         BaseType_t xHigherPriorityTaskWoken = pdFALSE;
 
         if (InputQueue != NULL) {
@@ -209,18 +220,6 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
       }
     }
   }
-}
-
-void HAL_I2C_MemRxCpltCallback(I2C_HandleTypeDef *hi2c)
-{
-    if (hi2c->Instance == I2C2)
-    {
-        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-        if (TaskEncoderHandle != NULL) {
-            vTaskNotifyGiveFromISR(TaskEncoderHandle, &xHigherPriorityTaskWoken);
-            portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
-        }
-    }
 }
 /* USER CODE END 4 */
 
@@ -247,13 +246,8 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
      * TIM2 Stepper Motor State Machine (ISR context)
      *
      * Called once per TIM2 period (one step pulse). Executes the
-     * trapezoidal motion profile by advancing through three phases:
-     *
-     *   ACCEL → CRUISE → DECEL → IDLE
-     *
-     * The S-curve lookup table (populated by stepper_start) is read
-     * forward during acceleration and backward during deceleration.
-     * ARR values are updated each step to change the pulse frequency.
+     * trapezoidal/triangular motion profile via inlined StepperProfile_StepTick.
+     * Real-time calculation runs in O(1) time with zero call overhead.
      * ===================================================================
      */
 
@@ -266,127 +260,23 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
         return;
     }
 
-    gStepperControl.totalStepsRemaining--;
+    StepperStepAction_e action = StepperProfile_StepTick(
+        &gStepperControl,
+        s_curve_norm,
+        TIMER_CLOCK,
+        PRESCALER
+    );
 
-    switch (gStepperControl.MotorState)
-    {
-
-        /* --- ACCELERATION PHASE ---
-         * Walk forward through the lookup table, increasing frequency each step.
-         * Transition to CRUISE when all accel steps are consumed, or directly
-         * to DECEL if the move is too short for a cruise phase (triangular profile).
-         */
-        case MOTOR_STATE_ACCEL:
-            gStepperControl.rampStepCounter++;
-            if (gStepperControl.rampStepCounter >= gStepperControl.accelSteps) {
-                /* Acceleration complete — max frequency */
-                float currentFreq = gStepperControl.startFreqHz + gStepperControl.freqDiff;
-                gStepperControl.ARRCurrent = (uint32_t)((float)TIMER_CLOCK / ((PRESCALER + 1) * currentFreq)) - 1;
-                gStepperControl.MotorState = MOTOR_STATE_CRUISE;
-            }
-            else {
-                /* Still accelerating — interpolate from s_curve_norm table */
-                float exact_index = ((float)gStepperControl.rampStepCounter * 255.0f) / (float)gStepperControl.accelSteps;
-                uint32_t index_int = (uint32_t)exact_index;
-                float fraction = exact_index - (float)index_int;
-
-                if (index_int >= 255) {
-                    index_int = 254;
-                    fraction = 1.0f;
-                }
-
-                float scale = s_curve_norm[index_int] + ((s_curve_norm[index_int + 1] - s_curve_norm[index_int]) * fraction);
-                float currentFreq = gStepperControl.startFreqHz + (gStepperControl.freqDiff * scale);
-                
-                gStepperControl.ARRCurrent = (uint32_t)((float)TIMER_CLOCK / ((PRESCALER + 1) * currentFreq)) - 1;
-            }
-
-            /* Early decel check: handles triangular profile (no cruise phase) */
-            if (gStepperControl.totalStepsRemaining <= gStepperControl.accelSteps) {
-                gStepperControl.MotorState = MOTOR_STATE_DECEL;
-            }
-            break;
-
-            /* --- CRUISE PHASE ---
-             * ARR stays constant at the maximum frequency. Wait until remaining
-             * steps equal the accel step count, then begin deceleration.
-             * while manual mode, deceleration set by button state from TaskUI
-             */
-        case MOTOR_STATE_CRUISE:
-            if ( (gStepperControl.totalStepsRemaining <= gStepperControl.accelSteps) && gStepperControl.MotorMode != MOTOR_MODE_MANUAL) {
-                gStepperControl.MotorState = MOTOR_STATE_DECEL;
-            }
-            /* ARR remains constant — no update needed */
-            break;
-
-            /* --- DECELERATION PHASE ---
-             * Walk backward through the same lookup table (mirror of acceleration).
-             * rampStepCounter decrements toward 0, producing a symmetric slowdown.
-             */
-        case MOTOR_STATE_DECEL:
-            /* Decrement step counter, stopping at 0 to prevent unsigned underflow */
-            if (gStepperControl.rampStepCounter > 0) {
-                gStepperControl.rampStepCounter--;
-            }
-            
-            /* Interpolate the corresponding ARR value from the lookup table */
-            if (gStepperControl.rampStepCounter < gStepperControl.accelSteps) {
-                float exact_index = ((float)gStepperControl.rampStepCounter * 255.0f) / (float)gStepperControl.accelSteps;
-                uint32_t index_int = (uint32_t)exact_index;
-                float fraction = exact_index - (float)index_int;
-
-                if (index_int >= 255) {
-                    index_int = 254;
-                    fraction = 1.0f;
-                }
-
-                float scale = s_curve_norm[index_int] + ((s_curve_norm[index_int + 1] - s_curve_norm[index_int]) * fraction);
-                float currentFreq = gStepperControl.startFreqHz + (gStepperControl.freqDiff * scale);
-                
-                gStepperControl.ARRCurrent = (uint32_t)((float)TIMER_CLOCK / ((PRESCALER + 1) * currentFreq)) - 1;
-            }
-            break;
-
-        default:
-            /* Safety fallback: unknown state → stop motor */
-            gStepperControl.MotorState = MOTOR_STATE_IDLE;
-            gStepperControl.MotorMode = MOTOR_MODE_NONE;
-            break;
-    }
-
-    /* --- Move completion check --- */
-    if (gStepperControl.totalStepsRemaining == 0) {
-        /* All steps executed — stop timer and PWM, return to idle */
+    if (action == STEP_ACTION_STOP_IDLE || action == STEP_ACTION_STOP_PAUSED) {
         HAL_TIM_Base_Stop_IT(&htim2);
         HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_1);
-        gStepperControl.MotorState = MOTOR_STATE_IDLE;
-        gStepperControl.MotorMode = MOTOR_MODE_NONE;
-    }
-    else if (gStepperControl.rampStepCounter < 1 && gStepperControl.MotorState == MOTOR_STATE_DECEL) {
-        HAL_TIM_Base_Stop_IT(&htim2);
-        HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_1);
-        
-        if (gStepperControl.MotorMode == MOTOR_MODE_MANUAL) {
-            /* Manual move finished */
-            gStepperControl.totalStepsRemaining = 0;
-            gStepperControl.MotorState = MOTOR_STATE_IDLE;
-            gStepperControl.MotorMode = MOTOR_MODE_NONE;
-        } 
-        else {
-            /* Motor decelerated to a stop, but steps remain (paused) */
-            gStepperControl.MotorState = MOTOR_STATE_PAUSED;
-        }
     }
     else {
-        /*
-         * Apply the new ARR value for the next pulse period.
-         * Compare value = ARR/2 maintains 50% duty cycle at all speeds.
-         */
         __HAL_TIM_SET_AUTORELOAD(htim, gStepperControl.ARRCurrent);
+        /* ARR/2 compare value maintains a symmetric 50% PWM step pulse duty cycle at all speeds */
         __HAL_TIM_SET_COMPARE(htim, TIM_CHANNEL_1,
                 gStepperControl.ARRCurrent / 2);
     }
-
   /* USER CODE END Callback 1 */
 }
 

@@ -26,15 +26,13 @@
  *          microsecond delays use the ARM DWT cycle counter. Once FreeRTOS is
  *          running, delays >= 1 ms use vTaskDelay() to yield the CPU.
  *
- * @note    Uses I2C1 peripheral handle (hi2c2).
+ * @note    Uses I2C2 peripheral handle (hi2c2).
  *          Two custom characters are pre-loaded into CGRAM slots 0 and 1
  *          during initialization.
  */
 
 #include "liquidcrystal_i2c.h"
 #include "FreeRTOS.h"
-#include "task.h"
-
 #include "task.h"
 #include "semphr.h"
 
@@ -45,11 +43,11 @@ extern SemaphoreHandle_t I2C2_Mutex;
 /*                           Module-Level State                               */
 /* -------------------------------------------------------------------------- */
 
-uint8_t dpFunction;   ///< HD44780 function set register (data width, lines, font)
-uint8_t dpControl;    ///< HD44780 display control register (display, cursor, blink)
-uint8_t dpMode;       ///< HD44780 entry mode register (direction, shift)
-uint8_t dpRows;       ///< Number of LCD rows configured at init
-uint8_t dpBacklight;  ///< Current backlight state (LCD_BACKLIGHT or LCD_NOBACKLIGHT)
+static uint8_t dpFunction;   ///< HD44780 function set register (data width, lines, font)
+static uint8_t dpControl;    ///< HD44780 display control register (display, cursor, blink)
+static uint8_t dpMode;       ///< HD44780 entry mode register (direction, shift)
+static uint8_t dpRows;       ///< Number of LCD rows configured at init
+static uint8_t dpBacklight;  ///< Current backlight state (LCD_BACKLIGHT or LCD_NOBACKLIGHT)
 
 /* -------------------------------------------------------------------------- */
 /*                      Static (Internal) Function Declarations               */
@@ -72,13 +70,13 @@ static void DelayUS(uint32_t);      ///< Microsecond delay (DWT or vTaskDelay)
  * @brief Custom character bitmap for CGRAM slot 0.
  * @details Each byte represents one row of a 5×8 pixel character (LSB = rightmost pixel).
  */
-uint8_t special1[8] = {0b00000, 0b11001, 0b11011, 0b00110,
+static uint8_t special1[8] = {0b00000, 0b11001, 0b11011, 0b00110,
                        0b01100, 0b11011, 0b10011, 0b00000};
 
 /**
  * @brief Custom character bitmap for CGRAM slot 1 (degree symbol variant).
  */
-uint8_t special2[8] = {0b11000, 0b11000, 0b00110, 0b01001,
+static uint8_t special2[8] = {0b11000, 0b11000, 0b00110, 0b01001,
                        0b01000, 0b01001, 0b00110, 0b00000};
 
 /* ========================================================================== */
@@ -376,6 +374,7 @@ static void Write4Bits(uint8_t value) {
  */
 static void ExpanderWrite(uint8_t _data) {
   uint8_t data = _data | dpBacklight;
+  /* Protect shared I2C2 bus against concurrent access from TaskEncoder */
   if (I2C2_Mutex != NULL) {
       xSemaphoreTake(I2C2_Mutex, portMAX_DELAY);
   }
@@ -405,7 +404,7 @@ static void PulseEnable(uint8_t _data) {
  *
  * @details Enables the Debug Exception and Monitor Control Register (DEMCR)
  *          trace bit, then enables the DWT cycle counter. This provides a
- *          free-running 32-bit counter clocked at SystemCoreClock (80 MHz),
+ *          free-running 32-bit counter clocked at SystemCoreClock (72 MHz),
  *          giving sub-microsecond resolution.
  *
  * @note   This must be called before any DelayUS() calls during early init
@@ -437,7 +436,7 @@ static void DelayInit(void) {
  *          - Otherwise: busy-wait using the DWT cycle counter for precise timing.
  *
  *          DWT calculation: cycles = (SystemCoreClock / 1_000_000) * us
- *          At 80 MHz, 1 µs = 80 cycles.
+ *          At 72 MHz, 1 µs = 72 cycles.
  *
  * @note   The RTOS-aware path avoids busy-waiting during long LCD delays
  *         (e.g., the 1000 ms backlight settle time during init), but falls
